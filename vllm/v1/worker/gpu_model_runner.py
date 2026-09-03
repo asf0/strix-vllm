@@ -579,6 +579,7 @@ class GPUModelRunner(
         # self.model: nn.Module  # Set after load_model
         # Initialize in initialize_kv_cache
         self.kv_caches: list[torch.Tensor] = []
+        self.kv_cache_group_ids: list[int] = []
         # indexes: [kv_cache_group_id][attn_group]
         self.attn_groups: list[list[AttentionGroup]] = []
         # self.kv_cache_config: KVCacheConfig
@@ -1141,7 +1142,7 @@ class GPUModelRunner(
             num_blocks=self.kv_cache_config.num_blocks,
         )
 
-    def _zero_block_ids(self, block_ids: list[int]) -> None:
+    def _zero_block_ids(self, block_ids: list[int] | tuple[list[int], ...]) -> None:
         """Zero the KV cache memory for the given block IDs."""
         if hasattr(self, "_kv_block_zeroer"):
             self._kv_block_zeroer.zero_block_ids(block_ids)
@@ -1207,8 +1208,16 @@ class GPUModelRunner(
         if scheduler_output.kv_cache_block_copies:
             copy_kv_cache_blocks_inplace(
                 self.kv_caches,
-                self.kv_cache_config.num_blocks,
+                (
+                    [
+                        self.kv_cache_config.get_num_blocks(group_id)
+                        for group_id in range(len(self.kv_cache_config.kv_cache_groups))
+                    ]
+                    if self.kv_cache_config.uses_multiple_pools
+                    else self.kv_cache_config.num_blocks
+                ),
                 scheduler_output.kv_cache_block_copies,
+                self.kv_cache_group_ids,
             )
 
         # Free the cached encoder outputs.
@@ -6957,6 +6966,7 @@ class GPUModelRunner(
             num_attn_module,
             kv_cache_groups=kv_cache_config.kv_cache_groups,
             layer_kv_caches=map_kv_caches_to_kernel_blocks(kv_caches, attn_groups),
+            runner_kv_cache_group_ids=self.kv_cache_group_ids,
         )
         return kv_caches
 

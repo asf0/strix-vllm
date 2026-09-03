@@ -92,9 +92,9 @@ def prepare_dcp_dummy_context_metadata(
     # DCP graph warmup may exercise context attention, so block-table entries
     # must point at allocated KV blocks.
     assert kv_cache_config is not None
-    max_valid_block_id = kv_cache_config.num_blocks - 1
-    assert max_valid_block_id > 0
-    for blk_table in input_batch.block_table.block_tables:
+    for group_id, blk_table in enumerate(input_batch.block_table.block_tables):
+        max_valid_block_id = kv_cache_config.get_num_blocks(group_id) - 1
+        assert max_valid_block_id > 0
         block_ids = [
             (block_idx % max_valid_block_id) + 1
             for block_idx in range(blk_table.max_num_blocks_per_req)
