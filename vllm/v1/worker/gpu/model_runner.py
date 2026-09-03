@@ -787,9 +787,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     for g in groups
                 ),
             )
-        self.kv_caches = [
-            cache for cache in kv_caches_dict.values() if cache.device == self.device
-        ]
+        # Pair each cache with its group so block copies use the right pool.
+        # Layers outside every group alias a grouped layer's cache.
+        group_id_by_layer = {
+            layer_name: group_id
+            for group_id, group in enumerate(self.kv_cache_config.kv_cache_groups)
+            for layer_name in group.layer_names
+        }
+        self.kv_caches: list[torch.Tensor] = []
+        self.kv_cache_group_ids: list[int] = []
+        for layer_name, cache in kv_caches_dict.items():
+            group_id = group_id_by_layer.get(layer_name)
+            if cache.device == self.device and group_id is not None:
+                self.kv_caches.append(cache)
+                self.kv_cache_group_ids.append(group_id)
         self.model_state.initialize_kv_cache(self.kv_cache_config, self.block_tables)
         if is_profiling:
             self.kv_connector = NO_OP_KV_CONNECTOR
@@ -1266,8 +1277,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if scheduler_output.kv_cache_block_copies:
             copy_kv_cache_blocks_inplace(
                 self.kv_caches,
-                self.kv_cache_config.num_blocks,
+                (
+                    [
+                        self.kv_cache_config.get_num_blocks(group_id)
+                        for group_id in range(len(self.kv_cache_config.kv_cache_groups))
+                    ]
+                    if self.kv_cache_config.uses_multiple_pools
+                    else self.kv_cache_config.num_blocks
+                ),
                 scheduler_output.kv_cache_block_copies,
+                self.kv_cache_group_ids,
             )
 
     def gather_batch_req_state(
@@ -1867,7 +1886,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                         input_batch,
                         self.block_tables,
                         context_len,
-                        self.kv_cache_config.num_blocks,
+                        (
+                            [
+                                self.kv_cache_config.get_num_blocks(group_id)
+                                for group_id in range(
+                                    len(self.kv_cache_config.kv_cache_groups)
+                                )
+                            ]
+                            if self.kv_cache_config.uses_multiple_pools
+                            else self.kv_cache_config.num_blocks
+                        ),
                         self.max_model_len,
                         input_block_tables=block_tables,
                     )

@@ -223,6 +223,9 @@ class SimpleCPUOffloadScheduler:
         # LCM) but is NOT assumed to equal it.
         self.fa_block_size: int = self.group_block_sizes[self.fa_gidx]
         assert self.block_size % self.fa_block_size == 0
+        # KV connectors (including this offloader) are rejected at config time
+        # with heterogeneous-width pools, so the coordinator owns one pool.
+        assert isinstance(self.cpu_coordinator.block_pool, BlockPool)
         self.cpu_block_pool: BlockPool = self.cpu_coordinator.block_pool
         # GPU block pool reference - bound after scheduler builds kv_cache_manager
         self._gpu_block_pool: BlockPool | None = None
