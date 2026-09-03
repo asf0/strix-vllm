@@ -164,6 +164,8 @@ class KVCacheBlock:
 
     # Block ID, ranging from 0 to num_gpu_blocks - 1.
     block_id: int
+    # Physical pool ID. Block IDs are unique only within this pool.
+    pool_id: int = 0
     # Reference count.
     ref_cnt: int = 0
     # Deferred frees may contain blocks from multiple pools.
@@ -216,6 +218,7 @@ class KVCacheBlock:
         next_block_id = self.next_free_block.block_id if self.next_free_block else None
         return (
             f"KVCacheBlock(block_id={self.block_id}, "
+            f"pool_id={self.pool_id}, "
             f"ref_cnt={self.ref_cnt}, "
             f"_block_hash={self._block_hash!r}, "
             f"_block_hash_num_tokens={self._block_hash_num_tokens}, "
@@ -253,6 +256,7 @@ def trim_null_head(blocks: _BlockSeq) -> _BlockSeq:
 class KVCacheBlockCopy(NamedTuple):
     src_block_id: int
     dst_block_id: int
+    group_id: int | None = None
 
 
 class FreeKVCacheBlockQueue:
@@ -1012,6 +1016,13 @@ def get_request_block_hasher(
     return request_block_hasher
 
 
+def _get_group_max_blocks_per_request(
+    vllm_config: VllmConfig, group: KVCacheGroupSpec
+) -> int:
+    spec = group.kv_cache_spec
+    return cdiv(spec.max_memory_usage_bytes(vllm_config), spec.page_size_bytes)
+
+
 def get_max_concurrency_for_kv_cache_config(
     vllm_config: VllmConfig, kv_cache_config: KVCacheConfig
 ) -> float:
@@ -1026,25 +1037,49 @@ def get_max_concurrency_for_kv_cache_config(
     call sites agree.
 
     Host groups use a separate pool; the smaller concurrency limit applies.
+    With heterogeneous-width pools, device groups draw ids from their own
+    physical pool, so the per-request total is computed per pool and the
+    smallest pool-level limit applies.
     """
-    num_blocks_per_request = 0
     host_blocks_per_request = 0
-    for group in kv_cache_config.kv_cache_groups:
-        required = cdiv(
-            group.kv_cache_spec.max_memory_usage_bytes(vllm_config),
-            group.kv_cache_spec.page_size_bytes,
+    if any(group.host_resident for group in kv_cache_config.kv_cache_groups):
+        host_blocks_per_request = sum(
+            _get_group_max_blocks_per_request(
+                vllm_config, kv_cache_config.kv_cache_groups[group_id]
+            )
+            for group_id in kv_cache_config.host_group_ids
         )
-        if group.host_resident:
-            host_blocks_per_request += required
-        else:
-            num_blocks_per_request += required
-    limits = [kv_cache_config.num_blocks / num_blocks_per_request]
+
+    if kv_cache_config.kv_cache_pools is None:
+        num_blocks_per_request = sum(
+            _get_group_max_blocks_per_request(vllm_config, group)
+            for group in kv_cache_config.kv_cache_groups
+            if not group.host_resident
+        )
+        limits = [kv_cache_config.num_blocks / num_blocks_per_request]
+        if host_blocks_per_request:
+            assert kv_cache_config.hisparse_host_num_blocks is not None
+            limits.append(
+                kv_cache_config.hisparse_host_num_blocks / host_blocks_per_request
+            )
+        return min(limits)
+
+    concurrency_by_pool = []
+    for pool in kv_cache_config.kv_cache_pools:
+        blocks_per_request = sum(
+            _get_group_max_blocks_per_request(
+                vllm_config, kv_cache_config.kv_cache_groups[group_id]
+            )
+            for group_id in pool.group_ids
+        )
+        if blocks_per_request:
+            concurrency_by_pool.append((pool.num_blocks - 1) / blocks_per_request)
     if host_blocks_per_request:
         assert kv_cache_config.hisparse_host_num_blocks is not None
-        limits.append(
+        concurrency_by_pool.append(
             kv_cache_config.hisparse_host_num_blocks / host_blocks_per_request
         )
-    return min(limits)
+    return min(concurrency_by_pool)
 
 
 def generate_scheduler_kv_cache_config(
@@ -1054,6 +1089,8 @@ def generate_scheduler_kv_cache_config(
     assert all(
         [cfg.num_blocks == kv_cache_configs[0].num_blocks for cfg in kv_cache_configs]
     )
+    expected_pools = kv_cache_configs[0].kv_cache_pools
+    assert all(cfg.kv_cache_pools == expected_pools for cfg in kv_cache_configs)
     assert all(
         cfg.hisparse_host_num_blocks == kv_cache_configs[0].hisparse_host_num_blocks
         for cfg in kv_cache_configs

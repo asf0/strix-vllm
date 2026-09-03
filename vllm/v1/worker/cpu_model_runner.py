@@ -111,14 +111,17 @@ class CPUModelRunner(GPUModelRunner):
     def _sync_device(self) -> None:
         pass
 
-    def _zero_block_ids(self, block_ids: list[int]) -> None:
+    def _zero_block_ids(self, block_ids: list[int] | tuple[list[int], ...]) -> None:
         # Zero full-attention blocks to prevent stale data corruption on partial writes.
         # Encoder-only (runner-only) layers are not FullAttentionSpec, so the
         # spec filter below already excludes them; no runner-only skip needed.
-        seen_ptrs: set[int] = set()
-        for group in self.kv_cache_config.kv_cache_groups:
+        zeroed_blocks: set[tuple[int, int]] = set()
+        for group_id, group in enumerate(self.kv_cache_config.kv_cache_groups):
             if not isinstance(group.kv_cache_spec, FullAttentionSpec):
                 continue
+            group_block_ids = (
+                block_ids[group_id] if isinstance(block_ids, tuple) else block_ids
+            )
             for layer_name in group.layer_names:
                 ctx = self.compilation_config.static_forward_context.get(layer_name)
                 if ctx is None:
@@ -126,10 +129,11 @@ class CPUModelRunner(GPUModelRunner):
                 kv = ctx.kv_cache
                 if not isinstance(kv, torch.Tensor):
                     continue
-                if kv.data_ptr() in seen_ptrs:
-                    continue
-                seen_ptrs.add(kv.data_ptr())
-                for block_id in block_ids:
+                for block_id in group_block_ids:
+                    key = (kv.data_ptr(), block_id)
+                    if key in zeroed_blocks:
+                        continue
+                    zeroed_blocks.add(key)
                     kv[block_id].zero_()
 
     def _to_list(self, sampled_token_ids: torch.Tensor) -> list[list[int]]:

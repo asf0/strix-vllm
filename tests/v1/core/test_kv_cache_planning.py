@@ -2136,3 +2136,226 @@ def test_kv_cache_groups_tp_replicas(specs, tp_size, dcp_size, expected):
     """Replicas are the gcd of each layer's tp_size // max_tp_shards."""
     groups = [KVCacheGroupSpec([f"l.{i}"], spec) for i, spec in enumerate(specs)]
     assert kv_cache_groups_tp_replicas(groups, tp_size, dcp_size) == expected
+
+
+def test_heterogeneous_group_widths_use_fixed_physical_subpools():
+    """A narrow group must not inherit the widest group's physical stride."""
+    spec = new_kv_cache_spec(block_size=16, num_kv_heads=1, head_size=8)
+    page = spec.page_size_bytes
+    groups = [
+        KVCacheGroupSpec(["wide.0", "wide.1"], spec),
+        KVCacheGroupSpec(["narrow.0"], spec),
+    ]
+    # Mirror the packing pass's padding annotation so the pool path engages.
+    groups[0].physical_bytes_per_block = 2 * page
+    vllm_config = VllmConfig(model_config=ModelConfig(max_model_len=16))
+    vllm_config.cache_config.kv_cache_layout = "BLHNC"
+
+    config = kv_cache_planning.get_kv_cache_config_from_groups(
+        vllm_config, groups, available_memory=31 * page
+    )
+
+    assert config.kv_cache_pools is not None
+    assert [pool.group_ids for pool in config.kv_cache_pools] == [(0,), (1,)]
+    assert [pool.bytes_per_block for pool in config.kv_cache_pools] == [
+        2 * page,
+        page,
+    ]
+    assert [pool.num_blocks for pool in config.kv_cache_pools] == [10, 11]
+    assert [pool.offset for pool in config.kv_cache_pools] == [0, 20 * page]
+    assert config.total_size == 31 * page
+
+    by_layer = {
+        layer: tensor for tensor in config.kv_cache_tensors for layer in tensor.layers
+    }
+    assert by_layer["wide.0"].block_stride == 2 * page
+    assert by_layer["wide.0"].offset == 0
+    assert by_layer["narrow.0"].block_stride == page
+    assert by_layer["narrow.0"].offset == 20 * page
+    assert all(tensor.size == 31 * page for tensor in config.kv_cache_tensors)
+
+
+def test_equal_group_widths_keep_single_shared_pool():
+    spec = new_kv_cache_spec(block_size=16, num_kv_heads=1, head_size=8)
+    page = spec.page_size_bytes
+    groups = [
+        KVCacheGroupSpec(["group.0"], spec),
+        KVCacheGroupSpec(["group.1"], spec),
+    ]
+    vllm_config = VllmConfig(model_config=ModelConfig(max_model_len=16))
+    vllm_config.cache_config.kv_cache_layout = "BLHNC"
+
+    config = kv_cache_planning.get_kv_cache_config_from_groups(
+        vllm_config, groups, available_memory=10 * page
+    )
+
+    assert config.kv_cache_pools is None
+    assert config.num_blocks == 10
+    assert config.total_size == 10 * page
+    assert {tensor.offset for tensor in config.kv_cache_tensors} == {0}
+
+
+def test_equal_width_hybrid_groups_keep_single_shared_pool():
+    page = 512
+    full = FullAttentionSpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=1,
+        dtype=torch.float16,
+        page_size_padded=page,
+    )
+    mamba = MambaSpec(
+        block_size=16,
+        shapes=((1,),),
+        dtypes=(torch.float16,),
+        page_size_padded=page,
+    )
+    groups = [
+        KVCacheGroupSpec(["mamba.0"], mamba),
+        KVCacheGroupSpec(["full.0"], full),
+    ]
+    vllm_config = VllmConfig(model_config=ModelConfig(max_model_len=16))
+    vllm_config.cache_config.kv_cache_layout = "BLHNC"
+
+    config = kv_cache_planning.get_kv_cache_config_from_groups(
+        vllm_config, groups, available_memory=10 * page
+    )
+
+    assert config.kv_cache_pools is None
+    assert config.num_blocks == 10
+    assert config.total_size == 10 * page
+
+
+def test_qwen35_mtp3_pool_plan_matches_exact_physical_accounting():
+    page = 3_294_720
+    max_model_len = 24_576
+    available_memory = 46_336_942_080
+    mtp_depth = 3
+    mamba = MambaSpec(
+        block_size=1_584,
+        shapes=((1,),),
+        dtypes=(torch.float16,),
+        page_size_padded=page,
+        mamba_cache_mode="align",
+        num_speculative_blocks=mtp_depth,
+    )
+    target = FullAttentionSpec(
+        block_size=1_584,
+        num_kv_heads=1,
+        head_size=1,
+        dtype=torch.uint8,
+        page_size_padded=page,
+    )
+    draft = replace(target, is_draft_kv_cache=True)
+    groups = [
+        KVCacheGroupSpec([f"gdn.{group}.{layer}" for layer in range(16)], mamba)
+        for group in range(3)
+    ] + [
+        KVCacheGroupSpec([f"target.{layer}" for layer in range(16)], target),
+        KVCacheGroupSpec(["mtp.0"], draft),
+    ]
+    # Mirror the packing pass's padding annotation so the pool path engages.
+    for group in groups:
+        group.physical_bytes_per_block = len(group.layer_names) * page
+    vllm_config = VllmConfig(model_config=ModelConfig(max_model_len=max_model_len))
+    vllm_config.cache_config.kv_cache_layout = "BLHNC"
+    vllm_config.cache_config.mamba_cache_mode = "align"
+
+    config = kv_cache_planning.get_kv_cache_config_from_groups(
+        vllm_config, groups, available_memory
+    )
+
+    assert config.kv_cache_pools is not None
+    assert [pool.group_ids for pool in config.kv_cache_pools] == [
+        (0, 1, 2, 3),
+        (4,),
+    ]
+    assert [pool.bytes_per_block for pool in config.kv_cache_pools] == [
+        16 * page,
+        page,
+    ]
+    assert [pool.num_blocks for pool in config.kv_cache_pools] == [851, 448]
+    assert [pool.size for pool in config.kv_cache_pools] == [
+        44_860_907_520,
+        1_476_034_560,
+    ]
+    assert config.total_size == available_memory
+    assert get_kv_cache_capacity(vllm_config, config) == (
+        673_858,
+        pytest.approx(27.419354838709676),
+    )
+
+
+def test_heterogeneous_pools_reject_unsupported_kv_connector():
+    spec = new_kv_cache_spec(block_size=16, num_kv_heads=1, head_size=8)
+    vllm_config = VllmConfig(model_config=ModelConfig(max_model_len=16))
+    vllm_config.cache_config.kv_cache_layout = "BLHNC"
+    vllm_config.kv_transfer_config = SimpleNamespace(kv_connector="NixlConnector")
+
+    groups = [
+        KVCacheGroupSpec(["wide.0", "wide.1"], spec),
+        KVCacheGroupSpec(["narrow.0"], spec),
+    ]
+    # Mirror the packing pass's padding annotation so the pool path engages.
+    groups[0].physical_bytes_per_block = 2 * spec.page_size_bytes
+
+    with pytest.raises(NotImplementedError, match="heterogeneous-width"):
+        kv_cache_planning.get_kv_cache_config_from_groups(
+            vllm_config,
+            groups,
+            available_memory=31 * spec.page_size_bytes,
+        )
+
+
+def test_pipeline_parallel_rejects_different_heterogeneous_pool_layouts(
+    monkeypatch,
+):
+    spec = new_kv_cache_spec(block_size=16, num_kv_heads=1, head_size=8)
+    global_groups = [
+        KVCacheGroupSpec(["wide.0", "wide.1"], spec),
+        KVCacheGroupSpec(["narrow.0"], spec),
+    ]
+    monkeypatch.setattr(
+        kv_cache_planning,
+        "get_kv_cache_groups",
+        lambda _config, _specs: global_groups,
+    )
+    vllm_config = VllmConfig(model_config=ModelConfig(max_model_len=16))
+    vllm_config.cache_config.kv_cache_layout = "BLHNC"
+
+    with pytest.raises(NotImplementedError, match="Pipeline-parallel"):
+        get_kv_cache_configs(
+            vllm_config,
+            [
+                {"wide.0": spec, "wide.1": spec, "narrow.0": spec},
+                {"wide.0": spec},
+            ],
+            [31 * spec.page_size_bytes, 31 * spec.page_size_bytes],
+        )
+
+
+def _qwen35_mtp_hybrid_specs():
+    """A Qwen3.8/Qwen3.5-shaped hybrid: GDN/Mamba layers with distinct page
+    sizes (so they form separate groups, as on Qwen3.8-27B), a set of target
+    full-attention layers with an identical spec, and one Qwen3_5MTP draft
+    full-attention layer marked is_draft_kv_cache.
+
+    The MTP layer's spec equals the target full-attention spec in every field
+    except the draft marker -- that marker is the only thing separating the
+    draft group from the target group.
+    """
+    specs = {
+        "mamba.layers.0": new_mamba_spec(block_size=64, mamba_cache_mode="align"),
+        "mamba.layers.1": new_mamba_spec(block_size=32, mamba_cache_mode="align"),
+        "mamba.layers.2": new_mamba_spec(block_size=16, mamba_cache_mode="align"),
+    }
+    target_full = FullAttentionSpec(
+        block_size=16,
+        num_kv_heads=8,
+        head_size=128,
+        dtype=torch.bfloat16,
+    )
+    for i in range(12):
+        specs[f"model.layers.{i}.self_attn.attn"] = target_full
+    specs["mtp.layers.0.self_attn.attn"] = replace(target_full, is_draft_kv_cache=True)
+    return specs

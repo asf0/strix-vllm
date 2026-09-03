@@ -6,6 +6,7 @@ import math
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import replace
+from fractions import Fraction
 from functools import partial, reduce
 from typing import Any
 
@@ -15,7 +16,10 @@ from vllm.utils.math_utils import cdiv, round_up
 from vllm.utils.mem_utils import format_gib
 from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1.core.kv_cache_config_builder import KVCacheConfigBuilder
-from vllm.v1.core.kv_cache_utils import _kv_cache_device_name
+from vllm.v1.core.kv_cache_utils import (
+    _get_group_max_blocks_per_request,
+    _kv_cache_device_name,
+)
 from vllm.v1.hisparse.layout import (
     get_hisparse_host_pool_bytes,
     get_hisparse_kv_cache_config,
@@ -31,6 +35,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheGroupSpec,
     KVCacheLayout,
+    KVCachePoolSpec,
     KVCacheSpec,
     KVCacheTensor,
     MambaSpec,
@@ -172,15 +177,13 @@ def check_enough_kv_cache_memory(
         # of the specs since grouping may unify them in-place.
         groups = get_kv_cache_groups(vllm_config, dict(kv_cache_spec))
         check_memory = (
-            available_memory - _pool_bytes_per_block(vllm_config, groups)
-            if groups
-            else available_memory
+            available_memory - _null_block_bytes(groups) if groups else available_memory
         )
         _check_enough_kv_cache_memory(
             check_memory,
-            lambda: max_memory_usage_bytes(vllm_config, kv_cache_spec.values()),
+            partial(_max_memory_usage_bytes_from_groups, vllm_config, groups),
             vllm_config.model_config.max_model_len,
-            lambda am: estimate_max_model_len(vllm_config, kv_cache_spec, am),
+            partial(_estimate_max_model_len_from_groups, vllm_config, groups),
         )
 
 
@@ -280,6 +283,10 @@ def _pool_bytes_per_block_from_builder(
         return 0
     if vllm_config.attention_config.hisparse_config is not None:
         return _pool_bytes_per_block(vllm_config, kv_cache_groups)
+    if _uses_heterogeneous_pools(kv_cache_groups):
+        # The placement splits into one pool per distinct block width, so one
+        # block ID spans several device backings: their widths add up.
+        return _null_block_bytes(kv_cache_groups)
     pool_bytes = builder._get_pool_bytes_per_block(vllm_config, kv_cache_groups)
     if pool_bytes is not None:
         return pool_bytes
@@ -302,6 +309,26 @@ def _pool_bytes_per_block_from_builder(
             "with several device allocations."
         )
     return backing_sizes.pop()
+
+
+def _uses_heterogeneous_pools(kv_cache_groups: list[KVCacheGroupSpec]) -> bool:
+    """Whether the placement needs one physical pool per distinct block width.
+
+    Mirrors the condition the config builder uses to split pools: at least one
+    group carries a padded physical width, and the raw page sums differ.
+    """
+    widths = {_get_group_bytes_per_block(group) for group in kv_cache_groups}
+    return (
+        any(group.physical_bytes_per_block is not None for group in kv_cache_groups)
+        and len({width for width in widths if width > 0}) > 1
+    )
+
+
+def _null_block_bytes(kv_cache_groups: list[KVCacheGroupSpec]) -> int:
+    """Physical bytes reserved by one null block in each fixed-width pool."""
+    return sum(
+        width for width, _group_ids in _get_physical_pool_groups(kv_cache_groups)
+    )
 
 
 def get_uniform_page_size(kv_cache_specs: Iterable[KVCacheSpec]) -> int:
@@ -518,9 +545,29 @@ def _get_kv_cache_groups_uniform_page_size(
     # is the minimum number of layers among all attention types. Need a better
     # strategy if we want to support more complex patterns (e.g., 20 full + 30
     # sw, where the group size should be 10).
-    min_num_layers = min([len(layers) for layers in layer_buckets])
+
+    def _is_draft_bucket(specs: list[KVCacheSpec]) -> bool:
+        # Drafter buckets (all layers marked is_draft_kv_cache) are emitted
+        # whole: they hold few layers by construction and must not drag the
+        # group-size heuristic down to their count.
+        return bool(specs) and all(
+            isinstance(spec, FullAttentionSpec) and spec.is_draft_kv_cache
+            for spec in specs
+        )
+
+    non_draft_buckets = [
+        (layers, specs)
+        for layers, specs in zip(layer_buckets, spec_buckets)
+        if not _is_draft_bucket(specs)
+    ]
+    if non_draft_buckets:
+        bucket_counts = [len(layers) for layers, _ in non_draft_buckets]
+        min_num_layers = min(bucket_counts)
+        max_num_layers = max(bucket_counts)
+    else:
+        min_num_layers = min(len(layers) for layers in layer_buckets)
+        max_num_layers = max(len(layers) for layers in layer_buckets)
     group_size = min_num_layers
-    max_num_layers = max([len(layers) for layers in layer_buckets])
     if max_num_layers < min_num_layers * 1.5:
         # If the number of layers is not much larger than the minimum number of
         # layers, use the maximum number of layers as the group size to avoid
@@ -531,7 +578,10 @@ def _get_kv_cache_groups_uniform_page_size(
         # extra layers to one attention type.
         group_size = max_num_layers
     grouped_layers = []
-    for layers in layer_buckets:
+    for layers, specs in zip(layer_buckets, spec_buckets):
+        if _is_draft_bucket(specs):
+            grouped_layers.append(layers)
+            continue
         num_padding_layers = group_size - len(layers) % group_size
         if num_padding_layers != group_size:
             logger.warning(
@@ -553,7 +603,22 @@ def _get_kv_cache_groups_uniform_page_size(
         # instead of layers[i * group_size: (i + 1) * group_size]
         for i in range(num_groups):
             grouped_layers.append(layers[i::num_groups])
-    return create_kv_cache_group_specs(kv_cache_spec, grouped_layers)
+    groups = create_kv_cache_group_specs(kv_cache_spec, grouped_layers)
+    for group, layer_names in zip(groups, grouped_layers):
+        if len(layer_names) == group_size or not layer_names:
+            continue
+        if all(
+            isinstance(spec, FullAttentionSpec) and spec.is_draft_kv_cache
+            for spec in iter_layer_specs(group.kv_cache_spec)
+        ):
+            continue
+        first_page = _get_per_layer_spec(group, layer_names[0]).page_size_bytes
+        assert all(
+            _get_per_layer_spec(group, layer_name).page_size_bytes == first_page
+            for layer_name in layer_names
+        )
+        group.physical_bytes_per_block = group_size * first_page
+    return groups
 
 
 def _get_per_layer_spec(
@@ -603,6 +668,103 @@ def _get_kv_cache_bytes_per_block(
         for layer_name in group.layer_names
     )
     return round_up(bytes_per_block, math.lcm(*alignments))
+
+
+def _get_group_bytes_per_block(group: KVCacheGroupSpec) -> int:
+    if group.physical_bytes_per_block is not None:
+        return group.physical_bytes_per_block
+    return sum(
+        _get_per_layer_spec(group, layer_name).page_size_bytes
+        for layer_name in group.layer_names
+    )
+
+
+def _get_physical_pool_groups(
+    kv_cache_groups: list[KVCacheGroupSpec],
+) -> list[tuple[int, list[int]]]:
+    """Group cache groups that can retain the legacy shared physical stride."""
+    group_ids_by_width: dict[int, list[int]] = {}
+    for group_id, group in enumerate(kv_cache_groups):
+        width = _get_group_bytes_per_block(group)
+        group_ids_by_width.setdefault(width, []).append(group_id)
+    return [(width, group_ids) for width, group_ids in group_ids_by_width.items()]
+
+
+def _plan_kv_cache_pools(
+    vllm_config: VllmConfig,
+    kv_cache_groups: list[KVCacheGroupSpec],
+    available_memory: int,
+) -> list[KVCachePoolSpec]:
+    physical_groups = _get_physical_pool_groups(kv_cache_groups)
+    override = vllm_config.cache_config.num_gpu_blocks_override
+    if override is not None:
+        num_blocks = [override] * len(physical_groups)
+    else:
+        required_blocks = [
+            sum(
+                _get_group_max_blocks_per_request(
+                    vllm_config, kv_cache_groups[group_id]
+                )
+                for group_id in group_ids
+            )
+            for _width, group_ids in physical_groups
+        ]
+        null_block_bytes = sum(width for width, _group_ids in physical_groups)
+        if available_memory < null_block_bytes:
+            num_blocks = [1] * len(physical_groups)
+        else:
+            request_bytes = sum(
+                width * blocks
+                for (width, _group_ids), blocks in zip(physical_groups, required_blocks)
+            )
+            concurrency = (
+                (available_memory - null_block_bytes) // request_bytes
+                if request_bytes
+                else 0
+            )
+            num_blocks = [1 + concurrency * blocks for blocks in required_blocks]
+            remaining = available_memory - sum(
+                count * width
+                for count, (width, _group_ids) in zip(num_blocks, physical_groups)
+            )
+
+            # Raise the lowest usable-blocks/request ratio first. If its next
+            # block does not fit, use the next-lowest affordable pool.
+            while True:
+                candidates = sorted(
+                    (
+                        pool_id
+                        for pool_id, required in enumerate(required_blocks)
+                        if required > 0
+                    ),
+                    key=lambda pool_id: (
+                        Fraction(
+                            num_blocks[pool_id] - 1,
+                            required_blocks[pool_id],
+                        ),
+                        pool_id,
+                    ),
+                )
+                selected = next(
+                    (
+                        pool_id
+                        for pool_id in candidates
+                        if physical_groups[pool_id][0] <= remaining
+                    ),
+                    None,
+                )
+                if selected is None:
+                    break
+                num_blocks[selected] += 1
+                remaining -= physical_groups[selected][0]
+
+    pools: list[KVCachePoolSpec] = []
+    offset = 0
+    for (width, group_ids), count in zip(physical_groups, num_blocks):
+        pool = KVCachePoolSpec(tuple(group_ids), count, width, offset)
+        pools.append(pool)
+        offset += pool.size
+    return pools
 
 
 def validate_kv_cache_layout(
@@ -675,14 +837,52 @@ def get_kv_cache_config_from_groups(
 
     layout = vllm_config.cache_config.get_resolved_kv_cache_layout()
     validate_kv_cache_layout(layout, kv_cache_groups)
-    bytes_per_block = _get_kv_cache_bytes_per_block(kv_cache_groups, layout)
-    interleaved_block_stride = bytes_per_block if layout.is_block_outermost else None
+    group_widths = [_get_group_bytes_per_block(group) for group in kv_cache_groups]
+    # Split into fixed-width physical pools only for groups the packing pass
+    # deliberately padded (physical_bytes_per_block annotated); differing raw
+    # page sums mean overlaying groups that share one pool, as upstream does.
+    uses_multiple_pools = (
+        any(group.physical_bytes_per_block is not None for group in kv_cache_groups)
+        and len({width for width in group_widths if width > 0}) > 1
+    )
+    if uses_multiple_pools:
+        transfer_config = vllm_config.kv_transfer_config
+        if transfer_config is not None and transfer_config.kv_connector is not None:
+            raise NotImplementedError(
+                "KV connectors and KV offloading do not yet support "
+                "heterogeneous-width KV cache pools."
+            )
+        # Pool widths are raw page sums, so no page may need stride padding.
+        if any(
+            _get_layer_block_stride(spec) != spec.page_size_bytes
+            for group in kv_cache_groups
+            for spec in iter_layer_specs(group.kv_cache_spec)
+        ):
+            raise NotImplementedError(
+                "Heterogeneous-width KV cache pools do not support padded "
+                "block strides."
+            )
+        kv_cache_pools = _plan_kv_cache_pools(
+            vllm_config, kv_cache_groups, available_memory
+        )
+        num_blocks = max(pool.num_blocks for pool in kv_cache_pools)
+        size = sum(pool.size for pool in kv_cache_pools)
+        group_to_pool = {
+            group_id: pool_id
+            for pool_id, pool in enumerate(kv_cache_pools)
+            for group_id in pool.group_ids
+        }
+    else:
+        bytes_per_block = max(group_widths)
+        num_blocks = available_memory // bytes_per_block
+        num_blocks = may_override_num_blocks(vllm_config, num_blocks)
+        size = bytes_per_block * num_blocks
+        kv_cache_pools = None
+        group_to_pool = {group_id: 0 for group_id in range(len(kv_cache_groups))}
 
-    num_blocks = available_memory // bytes_per_block
-    num_blocks = may_override_num_blocks(vllm_config, num_blocks)
-    size = bytes_per_block * num_blocks
-
-    # Groups alias from byte 0. Spec regions are laid out differently:
+    # Groups in the same physical pool alias that pool's starting offset.
+    # Pools of different widths occupy disjoint arena regions. Spec regions
+    # within a pool are laid out differently depending on the layout:
     #
     # block-outer (the same packing repeats for every block):
     # group 0: | blk 0 [ A | B  | pad ] | blk 1 [ A | B  | pad ] | ...
@@ -694,7 +894,22 @@ def get_kv_cache_config_from_groups(
     # group 1: | C [ blk 0 | blk 1 | ... ] | D [ blk 0 | blk 1 | ... ] |
 
     kv_cache_tensors = []
-    for group in kv_cache_groups:
+    shared_bytes_per_block = _get_kv_cache_bytes_per_block(kv_cache_groups, layout)
+    for group_id, group in enumerate(kv_cache_groups):
+        if kv_cache_pools is None:
+            group_num_blocks = num_blocks
+            group_offset = 0
+            # Upstream single-pool semantics: every group strides by the
+            # widest block so overlaying groups alias the same block tile.
+            group_block_stride = shared_bytes_per_block
+        else:
+            pool = kv_cache_pools[group_to_pool[group_id]]
+            group_num_blocks = pool.num_blocks
+            group_offset = pool.offset
+            group_block_stride = pool.bytes_per_block
+        interleaved_block_stride = (
+            group_block_stride if layout.is_block_outermost else None
+        )
         group_spec = group.kv_cache_spec
         layers_by_spec: defaultdict[KVCacheSpec, list[str]] = defaultdict(list)
         if isinstance(group_spec, UniformTypeKVCacheSpecs):
@@ -712,7 +927,7 @@ def get_kv_cache_config_from_groups(
                 block_stride = padded_page
             layer_stride, block_stride, _, _, _ = compute_layout_strides(
                 spec,
-                num_blocks,
+                group_num_blocks,
                 len(layer_names),
                 layout,
                 fixed_strides=(None, block_stride, None, None, None),
@@ -723,7 +938,7 @@ def get_kv_cache_config_from_groups(
                     layers=layer_names,
                     layer_stride=layer_stride,
                     block_stride=block_stride,
-                    offset=byte_offset,
+                    offset=group_offset + byte_offset,
                 )
             )
             # Block-outer layers share each block; layer-outer ones own regions.
@@ -731,10 +946,25 @@ def get_kv_cache_config_from_groups(
                 spec.page_size_bytes if layout.is_block_outermost else layer_stride
             )
 
+    if kv_cache_pools is not None:
+        for pool_id, pool in enumerate(kv_cache_pools):
+            logger.info(
+                "KV cache physical pool %d: groups=%s, blocks=%d, "
+                "bytes/block=%d, allocation=%d bytes (%.2f GiB), offset=%d",
+                pool_id,
+                pool.group_ids,
+                pool.num_blocks,
+                pool.bytes_per_block,
+                pool.size,
+                pool.size / (1 << 30),
+                pool.offset,
+            )
+
     return KVCacheConfig(
         num_blocks=num_blocks,
         kv_cache_tensors=kv_cache_tensors,
         kv_cache_groups=kv_cache_groups,
+        kv_cache_pools=kv_cache_pools,
         prefix_cache_retention_interval=(
             vllm_config.cache_config.prefix_cache_retention_interval
         ),
@@ -952,7 +1182,14 @@ def _get_packed_kv_cache_groups(
         # supported; counts sharing a gcd > 1 (e.g. 2:1) could in principle
         # repeat too, but such buckets are emitted whole instead.
         balanced = len(set(map(len, page_size_layers.values()))) == 1
-        bucketed.append((uniform_spec, page_size_layers, balanced))
+        # Drafter buckets (all layers marked is_draft_kv_cache) are emitted
+        # whole: they hold few layers by construction and must not participate
+        # in the repeat-pattern split.
+        is_draft = all(
+            isinstance(s, FullAttentionSpec) and s.is_draft_kv_cache
+            for s in uniform_spec.kv_cache_specs.values()
+        )
+        bucketed.append((uniform_spec, page_size_layers, balanced, is_draft))
 
     # Balanced buckets that mix page sizes must stay whole, so the largest one
     # sets a floor on the repeats per group; larger single-size buckets are
@@ -960,8 +1197,8 @@ def _get_packed_kv_cache_groups(
     min_repeats_per_group = max(
         (
             spec.get_max_layers_per_page_size()
-            for spec, page_size_layers, balanced in bucketed
-            if balanced and len(page_size_layers) > 1
+            for spec, page_size_layers, balanced, is_draft in bucketed
+            if balanced and len(page_size_layers) > 1 and not is_draft
         ),
         default=0,
     )
@@ -969,8 +1206,8 @@ def _get_packed_kv_cache_groups(
         _approximate_gcd(
             [
                 spec.get_max_layers_per_page_size()
-                for spec, _, balanced in bucketed
-                if balanced
+                for spec, _, balanced, is_draft in bucketed
+                if balanced and not is_draft
             ],
             lower_bound=min_repeats_per_group,
         )
@@ -978,10 +1215,12 @@ def _get_packed_kv_cache_groups(
         else None
     )
 
-    def num_groups_for(spec: UniformTypeKVCacheSpecs, balanced: bool) -> int:
-        if balanced and repeats_per_group is not None:
-            return cdiv(spec.get_max_layers_per_page_size(), repeats_per_group)
-        return 1
+    def num_groups_for(
+        spec: UniformTypeKVCacheSpecs, balanced: bool, is_draft: bool
+    ) -> int:
+        if is_draft or not balanced or repeats_per_group is None:
+            return 1
+        return cdiv(spec.get_max_layers_per_page_size(), repeats_per_group)
 
     def widest_group_bytes(page_size_layers: dict[int, list[str]], n: int) -> int:
         """Page bytes of the largest of the n groups a bucket splits into."""
@@ -1005,16 +1244,16 @@ def _get_packed_kv_cache_groups(
                 page_size_layers,
                 len(spec.kv_cache_specs)
                 if is_state_bucket(spec)
-                else num_groups_for(spec, balanced),
+                else num_groups_for(spec, balanced, is_draft),
             )
-            for spec, page_size_layers, balanced in bucketed
+            for spec, page_size_layers, balanced, is_draft in bucketed
         ),
         default=0,
     )
 
     groups = []
-    for spec, page_size_layers, balanced in bucketed:
-        num_groups = num_groups_for(spec, balanced)
+    for spec, page_size_layers, balanced, is_draft in bucketed:
+        num_groups = num_groups_for(spec, balanced, is_draft)
         # Cap a state group at the states a block already fits rather than let
         # it widen the block.
         if anchor_bytes and is_state_bucket(spec):
@@ -1069,6 +1308,29 @@ def _warn_if_unannotated_eagle_mamba(
         "could be identified as the draft model's.",
         spec_config.method,
     )
+
+
+def _log_kv_cache_group_layout(
+    vllm_config: VllmConfig, kv_cache_groups: list[KVCacheGroupSpec]
+) -> None:
+    """Log the per-group draft annotation once, for hybrid + spec-decode runs.
+
+    Makes the resulting group layout visible at startup so incorrect annotation
+    (e.g. a Mamba group wrongly marked as a draft group) can be checked
+    without attaching a debugger.
+    """
+    spec_config = vllm_config.speculative_config
+    if spec_config is None or not spec_config.use_eagle():
+        return
+    if len(kv_cache_groups) <= 1:
+        return
+    for idx, group in enumerate(kv_cache_groups):
+        logger.info_once(
+            "KV cache group %d: layers=%s draft/eagle=%s",
+            idx,
+            tuple(group.layer_names),
+            group.is_eagle_group,
+        )
 
 
 def _largest_divisor_at_most(value: int, limit: int) -> int:
@@ -1261,8 +1523,8 @@ def _max_memory_usage_bytes_from_groups(
     model has 8 full attention layers and 9 sliding window layers, they will
     be padded to 9 full + 9 sliding window for uniform group sizes.
 
-    Each group independently claims blocks from the shared pool, so a request consumes
-    the sum of the per-group block counts, i.e. ``bytes_per_block * total_blocks``.
+    Each group consumes its own physical width. Groups with equal widths may
+    share one fixed-width pool without changing this per-request byte cost.
     """
     kv_cache_groups = [group for group in kv_cache_groups if not group.host_resident]
     if not kv_cache_groups:
@@ -1449,10 +1711,11 @@ def _project_kv_cache_groups_to_worker(
             KVCacheGroupSpec(
                 worker_layer_names,
                 group_spec,
-                is_eagle_group=group.is_eagle_group,
+                is_eagle_group=group.is_eagle_group and bool(worker_layer_names),
                 host_resident=group.host_resident,
                 enable_kv_transfer=group.enable_kv_transfer,
                 role=group.role,
+                physical_bytes_per_block=group.physical_bytes_per_block,
             )
         )
     return projected_groups
@@ -1545,6 +1808,22 @@ def get_kv_cache_configs(
         _project_kv_cache_groups_to_worker(global_kv_cache_groups, worker_spec)
         for worker_spec in kv_cache_specs
     ]
+    projected_widths = [
+        tuple(_get_group_bytes_per_block(group) for group in groups)
+        for groups in projected_groups_per_worker
+    ]
+    if (
+        len(projected_widths) > 1
+        and len(set(projected_widths)) > 1
+        and any(
+            len({width for width in widths if width > 0}) > 1
+            for widths in projected_widths
+        )
+    ):
+        raise NotImplementedError(
+            "Pipeline-parallel workers with different heterogeneous-width "
+            "KV pool layouts are not supported yet. Use pipeline_parallel_size=1."
+        )
 
     # If `num_gpu_blocks_override` is set, the cache size that will actually
     # be allocated is decoupled from the profiled `available_memory`. Reflect
@@ -1616,22 +1895,37 @@ def get_kv_cache_configs(
             )
         )
 
-    # Change the num_blocks of each rank to the smallest among all ranks.
-    # We also need to shrink the tensor size proportionally to avoid
-    # allocating unused memory.
-    min_num_blocks = min(
-        kv_cache_config.num_blocks for kv_cache_config in kv_cache_configs
-    )
-    for i, kv_cache_config in enumerate(kv_cache_configs):
-        if kv_cache_config.num_blocks == min_num_blocks:
-            continue
-        # Re-plan with exactly the smallest rank's block count, so strides and
-        # offsets stay consistent with the shrunken allocation.
-        kv_cache_configs[i] = builder.get_kv_cache_config_from_groups(
-            vllm_config,
-            kv_cache_config.kv_cache_groups,
-            min_num_blocks,
-        )
+    if all(config.kv_cache_pools is None for config in kv_cache_configs):
+        # Change the num_blocks of each rank to the smallest among all ranks.
+        # We also need to shrink the tensor size proportionally to avoid
+        # allocating unused memory.
+        min_num_blocks = min(config.num_blocks for config in kv_cache_configs)
+        for i, kv_cache_config in enumerate(kv_cache_configs):
+            if kv_cache_config.num_blocks == min_num_blocks:
+                continue
+            # Re-plan with exactly the smallest rank's block count, so strides
+            # and offsets stay consistent with the shrunken allocation.
+            kv_cache_configs[i] = builder.get_kv_cache_config_from_groups(
+                vllm_config,
+                kv_cache_config.kv_cache_groups,
+                min_num_blocks,
+            )
+    else:
+        if any(config.kv_cache_pools is None for config in kv_cache_configs):
+            raise NotImplementedError(
+                "Workers disagree on whether heterogeneous-width KV pools are "
+                "required. This pipeline-parallel layout is not supported yet."
+            )
+        # Re-plan every rank against the smallest physical allocation so workers
+        # expose identical pool counts and block-table ranges.
+        min_allocation_bytes = min(config.total_size for config in kv_cache_configs)
+        for i, kv_cache_config in enumerate(kv_cache_configs):
+            if kv_cache_config.total_size == min_allocation_bytes:
+                continue
+            groups = kv_cache_config.kv_cache_groups
+            kv_cache_configs[i] = get_kv_cache_config_from_groups(
+                vllm_config, groups, min_allocation_bytes
+            )
 
     for kv_cache_config in kv_cache_configs:
         kv_cache_config.kv_tp_replicas = kv_cache_groups_tp_replicas(

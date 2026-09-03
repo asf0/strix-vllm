@@ -116,7 +116,7 @@ class KVBlockZeroer:
         attn_groups_iter: Iterable["AttentionGroup"],
         kernel_block_sizes: list[int],
         static_forward_context: dict[str, Any],
-        num_blocks: int,
+        num_blocks: int | None = None,
         runner_only_attn_layers: set[str] | None = None,
     ) -> None:
         """Precompute the absolute-address table for the Triton zeroing kernel.
@@ -135,12 +135,19 @@ class KVBlockZeroer:
         Each virtual block is represented as an independent segment so its
         physical block stride and zeroed page span remain independent.
 
+        ``num_blocks`` is the single shared pool's logical block count; with
+        heterogeneous-width pools each group addresses its own pool, so the
+        per-group virtual-split ratio is derived from the spec instead.
+
         Only AttentionSpec layers are processed; Mamba layers are skipped.
         """
         self.device = device
         self._meta: (
             tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int, int] | None
         ) = None
+        self._meta_by_group: dict[
+            int, tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int, int]
+        ] = {}
 
         if runner_only_attn_layers is None:
             runner_only_attn_layers = set()
@@ -151,6 +158,27 @@ class KVBlockZeroer:
         seg_addrs: list[int] = []
         seg_block_strides: list[int] = []
         seg_page_sizes: list[int] = []
+        group_segments: dict[
+            int, tuple[dict[int, int], list[int], list[int], list[int]]
+        ] = {}
+
+        def add_segment(
+            addr: int,
+            block_stride: int,
+            page_size: int,
+            seen: dict[int, int],
+            addrs: list[int],
+            strides: list[int],
+            page_sizes: list[int],
+        ) -> None:
+            if (idx := seen.get(addr)) is not None:
+                assert strides[idx] == block_stride
+                page_sizes[idx] = max(page_sizes[idx], page_size)
+                return
+            seen[addr] = len(addrs)
+            addrs.append(addr)
+            strides.append(block_stride)
+            page_sizes.append(page_size)
 
         for group in attn_groups_iter:
             spec = group.kv_cache_spec
@@ -160,6 +188,15 @@ class KVBlockZeroer:
                 continue
             kernel_bs = kernel_block_sizes[group.kv_cache_group_id]
             assert spec.block_size % kernel_bs == 0
+            if num_blocks is None:
+                # Heterogeneous pools: each group addresses its own pool, so
+                # derive the virtual-split ratio from the spec alone.
+                ratio = spec.block_size // kernel_bs
+            group_id = group.kv_cache_group_id
+            group_seen, group_addrs, group_strides, group_page_sizes = (
+                group_segments.setdefault(group_id, ({}, [], [], []))
+            )
+
             for layer_name in group.layer_names:
                 if layer_name in runner_only_attn_layers:
                     continue
@@ -168,16 +205,20 @@ class KVBlockZeroer:
                     continue
                 if group.kernel_block_stride:
                     # Bound views address kernel blocks; zero by manager block.
+                    assert num_blocks is not None, (
+                        "Kernel-block KV views need a single KV cache pool"
+                    )
                     kv = group.map_kv_cache_to_manager_blocks(kv, num_blocks)
                 if kv.device.type != self.device.type:
                     continue
                 dp = kv.data_ptr()
 
-                assert kv.shape[0] % num_blocks == 0, (
-                    f"{layer_name}: {kv.shape[0]} kernel blocks is not a "
-                    f"multiple of {num_blocks} logical blocks"
-                )
-                ratio = kv.shape[0] // num_blocks
+                if num_blocks is not None:
+                    assert kv.shape[0] % num_blocks == 0, (
+                        f"{layer_name}: {kv.shape[0]} kernel blocks is not a "
+                        f"multiple of {num_blocks} logical blocks"
+                    )
+                    ratio = kv.shape[0] // num_blocks
 
                 el = kv.element_size()
                 block_stride_bytes = kv.stride(0) * el
@@ -200,38 +241,66 @@ class KVBlockZeroer:
                     assert (dp + off_bytes) % 4 == 0
                     for virtual_index in range(ratio):
                         addr = dp + off_bytes + virtual_index * block_stride_bytes
-                        if (idx := seen_ptrs.get(addr)) is not None:
-                            assert (
-                                seg_block_strides[idx]
-                                == logical_block_stride_bytes // 4
-                            )
-                            seg_page_sizes[idx] = max(
-                                seg_page_sizes[idx], kernel_page_bytes // 4
-                            )
-                            continue
-                        seen_ptrs[addr] = len(seg_addrs)
-                        seg_addrs.append(addr)
-                        seg_block_strides.append(logical_block_stride_bytes // 4)
-                        seg_page_sizes.append(kernel_page_bytes // 4)
+                        stride = logical_block_stride_bytes // 4
+                        page_size = kernel_page_bytes // 4
+                        add_segment(
+                            addr,
+                            stride,
+                            page_size,
+                            seen_ptrs,
+                            seg_addrs,
+                            seg_block_strides,
+                            seg_page_sizes,
+                        )
+                        add_segment(
+                            addr,
+                            stride,
+                            page_size,
+                            group_seen,
+                            group_addrs,
+                            group_strides,
+                            group_page_sizes,
+                        )
 
-        if not seg_addrs:
-            self._meta = None
-            return
+        self._meta = self._build_meta(seg_addrs, seg_block_strides, seg_page_sizes)
+        self._meta_by_group = {
+            group_id: meta
+            for group_id, (_seen, addrs, strides, page_sizes) in group_segments.items()
+            if (meta := self._build_meta(addrs, strides, page_sizes)) is not None
+        }
 
-        max_page_size_el = max(seg_page_sizes)
+    def _build_meta(
+        self, addrs: list[int], strides: list[int], page_sizes: list[int]
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int, int] | None:
+        if not addrs:
+            return None
+        max_page_size_el = max(page_sizes)
         blk_size = min(1 << (max_page_size_el - 1).bit_length(), 1024)
-        self._meta = (
-            torch.tensor(seg_addrs, dtype=torch.uint64, device=self.device),
-            torch.tensor(seg_block_strides, dtype=torch.int64, device=self.device),
-            torch.tensor(seg_page_sizes, dtype=torch.int64, device=self.device),
+        return (
+            torch.tensor(addrs, dtype=torch.uint64, device=self.device),
+            torch.tensor(strides, dtype=torch.int64, device=self.device),
+            torch.tensor(page_sizes, dtype=torch.int64, device=self.device),
             (max_page_size_el + blk_size - 1) // blk_size,
             blk_size,
-            len(seg_addrs),
+            len(addrs),
         )
 
-    def zero_block_ids(self, block_ids: list[int]) -> None:
+    def zero_block_ids(self, block_ids: list[int] | tuple[list[int], ...]) -> None:
         """Zero the KV cache memory for the given block IDs."""
-        if not block_ids or self._meta is None:
+        if not block_ids:
+            return
+        if isinstance(block_ids, tuple):
+            for group_id, group_block_ids in enumerate(block_ids):
+                self._zero_block_ids(group_block_ids, self._meta_by_group.get(group_id))
+            return
+        self._zero_block_ids(block_ids, self._meta)
+
+    def _zero_block_ids(
+        self,
+        block_ids: list[int],
+        meta: tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int, int] | None,
+    ) -> None:
+        if not block_ids or meta is None:
             return
         (
             seg_addrs,
@@ -240,7 +309,7 @@ class KVBlockZeroer:
             max_chunks,
             blk_size,
             n_segs,
-        ) = self._meta
+        ) = meta
         n_blocks = len(block_ids)
         idx = async_tensor_h2d(block_ids, device=self.device, dtype=torch.int64)
         grid = (n_blocks, n_segs, max_chunks)
@@ -612,6 +681,9 @@ def allocate_kv_cache(
             continue
 
         num_blocks = kv_cache_config.num_blocks_of(tensor)
+        if kv_cache_config.kv_cache_pools is not None:
+            # Pool-backed tensors address their own pool's block range.
+            num_blocks = kv_cache_config.get_num_blocks(group_id)
         kernel_block_size = None
         if kernel_block_sizes is not None and group_id < len(kernel_block_sizes):
             kernel_block_size = kernel_block_sizes[group_id]
@@ -815,6 +887,7 @@ def bind_kv_cache(
     num_attn_module: int = 1,
     kv_cache_groups: Sequence[KVCacheGroupSpec] | None = None,
     layer_kv_caches: dict[str, torch.Tensor] | None = None,
+    runner_kv_cache_group_ids: list[int] | None = None,
 ) -> None:
     """Bind the allocated KV cache to both ModelRunner and forward context so
     that the KV cache can be used in the forward pass.
@@ -836,10 +909,20 @@ def bind_kv_cache(
         layer_kv_caches: The views to bind to layers when they differ from
             kv_caches (e.g. kernel-block views). The runner keeps kv_caches,
             which are addressed by scheduler block IDs.
+        runner_kv_cache_group_ids: If given, filled in parallel with
+            `runner_kv_caches` with each entry's KV cache group id.
 
     """
     # Bind kv_caches to ModelRunner
     assert len(runner_kv_caches) == 0
+    if runner_kv_cache_group_ids is not None:
+        assert kv_cache_groups is not None
+        assert len(runner_kv_cache_group_ids) == 0
+        group_id_by_layer = {
+            layer_name: group_id
+            for group_id, group in enumerate(kv_cache_groups)
+            for layer_name in group.layer_names
+        }
 
     # Convert kv_caches dict to a list of tensors in the order of layer_index.
     index2name = defaultdict(list)
@@ -859,6 +942,8 @@ def bind_kv_cache(
             current_platform.check_runner_kv_caches_multi_layer()
         for layer_name in layer_names:
             runner_kv_caches.append(kv_caches[layer_name])
+            if runner_kv_cache_group_ids is not None:
+                runner_kv_cache_group_ids.append(group_id_by_layer[layer_name])
 
     bind_kv_cache_to_layers(
         layer_kv_caches or kv_caches, forward_context, num_attn_module, kv_cache_groups
@@ -908,17 +993,27 @@ def clear_layer_kv_caches(layers: Iterable[Any]) -> None:
 
 def copy_kv_cache_blocks_inplace(
     kv_caches: Iterable[torch.Tensor],
-    num_blocks: int,
+    num_blocks: int | Sequence[int],
     kv_cache_block_copies: Sequence[KVCacheBlockCopy],
+    cache_group_ids: Sequence[int] | None = None,
 ) -> None:
     if not kv_cache_block_copies:
         return
 
-    indices_np = np.array(kv_cache_block_copies, dtype=np.int64)
-    indices: torch.Tensor | None = None
+    kv_caches = list(kv_caches)
+    if cache_group_ids is None:
+        cache_group_ids = [0] * len(kv_caches)
+    assert len(cache_group_ids) == len(kv_caches)
+    copies_by_group: dict[int | None, list[tuple[int, int]]] = defaultdict(list)
+    for copy in kv_cache_block_copies:
+        copies_by_group[copy.group_id].append((copy.src_block_id, copy.dst_block_id))
+    indices_by_device_group: dict[tuple[torch.device, int | None], torch.Tensor] = {}
     seen: set[tuple[torch.device, int]] = set()
     copied_storages: set[tuple[torch.device, int]] = set()
-    for cache in kv_caches:
+    for cache, group_id in zip(kv_caches, cache_group_ids):
+        group_copies = copies_by_group.get(group_id, copies_by_group.get(None))
+        if not group_copies:
+            continue
         # Layers sharing KV (cross-layer sharing) alias the same view; copy it
         # once. data_ptr distinguishes per-layer views of a shared allocation.
         key = (cache.device, cache.data_ptr())
@@ -926,32 +1021,43 @@ def copy_kv_cache_blocks_inplace(
             continue
         seen.add(key)
 
+        indices_key = (
+            cache.device,
+            group_id if group_id in copies_by_group else None,
+        )
+        indices = indices_by_device_group.get(indices_key)
         if indices is None:
-            indices = async_tensor_h2d(indices_np, device=cache.device)
+            indices = async_tensor_h2d(
+                np.array(group_copies, dtype=np.int64), device=cache.device
+            )
+            indices_by_device_group[indices_key] = indices
         assert cache.device == indices.device
         src, dst = indices.unbind(dim=1)
 
-        kernel_blocks_per_block, remainder = divmod(cache.shape[0], num_blocks)
+        group_num_blocks = (
+            num_blocks if isinstance(num_blocks, int) else num_blocks[group_id]
+        )
+        kernel_blocks_per_block, remainder = divmod(cache.shape[0], group_num_blocks)
         assert remainder == 0, (
             f"{cache.shape[0]} kernel blocks not divisible by "
-            f"{num_blocks} scheduler blocks"
+            f"{group_num_blocks} scheduler blocks"
         )
         storage = cache.untyped_storage()
         storage_key = (cache.device, storage.data_ptr())
         scheduler_block_stride = (
             cache.stride(0) * cache.element_size() * kernel_blocks_per_block
         )
-        if storage.nbytes() == num_blocks * scheduler_block_stride:
+        if storage.nbytes() == group_num_blocks * scheduler_block_stride:
             if storage_key in copied_storages:
                 continue
             copied_storages.add(storage_key)
             blocks = torch.empty(0, dtype=torch.uint8, device=cache.device)
             blocks.set_(storage)
-            blocks = blocks.view(num_blocks, -1)
+            blocks = blocks.view(group_num_blocks, -1)
         else:
             # Fold virtual block splitting into the shape so that dim 0 counts
             # scheduler blocks; unflatten of dim 0 is always a view.
-            blocks = cache.unflatten(0, (num_blocks, kernel_blocks_per_block))
+            blocks = cache.unflatten(0, (group_num_blocks, kernel_blocks_per_block))
         blocks[dst] = blocks[src]
 
 
