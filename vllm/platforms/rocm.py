@@ -1370,15 +1370,24 @@ class RocmPlatform(Platform):
         using_inductor = cc.backend == "inductor" and cc.mode != CompilationMode.NONE
         default = ["native"] if using_inductor else ["vllm_c", "native"]
 
-        #  Aiter rms norm perform best when CUDA Graph capture is enabled.
+        # AITER RMSNorm performs best with CUDA Graph capture. Its binding is
+        # incompatible with DFlash profiling on Strix Halo (gfx1151), though,
+        # so retain AITER for other operations and use native RMSNorm for that
+        # exact configuration.
         # TODO(Rohan138/dllehr-amd/rasmith) Change this to be an inclusive
         # check instead of exclusive check in the future.
+        is_gfx1151_dflash = (
+            on_gfx1151()
+            and vllm_config.speculative_config is not None
+            and vllm_config.speculative_config.method == "dflash"
+        )
         if (
             cc.cudagraph_mode != CUDAGraphMode.NONE
             and envs.VLLM_ROCM_USE_AITER
             and envs.VLLM_ROCM_USE_AITER_RMSNORM
             and not on_rdna4()
             and not on_gfx90a()  # AITER not built for gfx90a, rmsnorm -> SEGV.
+            and not is_gfx1151_dflash
         ):
             rms_norm = ["aiter"] + default
         else:
