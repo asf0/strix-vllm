@@ -741,6 +741,23 @@ def validate_kv_cache_layout(
         )
 
 
+def _is_hidden_states_export(vllm_config: VllmConfig) -> bool:
+    """Whether this run is offline hidden-state export.
+
+    Strict double-gate: only ExampleHiddenStatesConnector together with the
+    extract_hidden_states speculative method qualifies. All other connectors
+    must keep the heterogeneous-width NotImplementedError below.
+    """
+    transfer_config = vllm_config.kv_transfer_config
+    speculative_config = vllm_config.speculative_config
+    return (
+        transfer_config is not None
+        and transfer_config.kv_connector == "ExampleHiddenStatesConnector"
+        and speculative_config is not None
+        and speculative_config.method == "extract_hidden_states"
+    )
+
+
 def get_kv_cache_config_from_groups(
     vllm_config: VllmConfig,
     kv_cache_groups: list[KVCacheGroupSpec],
@@ -785,6 +802,14 @@ def get_kv_cache_config_from_groups(
         any(group.physical_bytes_per_block is not None for group in kv_cache_groups)
         and len({width for width in group_widths if width > 0}) > 1
     )
+    if uses_multiple_pools and _is_hidden_states_export(vllm_config):
+        logger.warning(
+            "Hidden-state export (ExampleHiddenStatesConnector + "
+            "extract_hidden_states) forces the legacy single shared KV cache "
+            "pool; heterogeneous-width physical subpools are disabled for "
+            "this offline export only."
+        )
+        uses_multiple_pools = False
     if uses_multiple_pools:
         transfer_config = vllm_config.kv_transfer_config
         if transfer_config is not None and transfer_config.kv_connector is not None:
