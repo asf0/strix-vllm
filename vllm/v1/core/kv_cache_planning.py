@@ -898,7 +898,10 @@ def get_kv_cache_config_from_groups(
             for group_id in pool.group_ids
         }
     else:
-        bytes_per_block = max(group_widths)
+        # Size by the aligned stride the tensors below use, not raw page sums.
+        bytes_per_block = max(
+            *group_widths, _get_kv_cache_bytes_per_block(kv_cache_groups, layout)
+        )
         num_blocks = available_memory // bytes_per_block
         num_blocks = may_override_num_blocks(vllm_config, num_blocks)
         size = bytes_per_block * num_blocks
