@@ -820,7 +820,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             attn_groups_iter=(g for groups in self.attn_groups for g in groups),
             kernel_block_sizes=self.kernel_block_sizes,
             static_forward_context=self.compilation_config.static_forward_context,
-            num_blocks=self.kv_cache_config.num_blocks,
+            # Separate physical pools may have different logical block
+            # counts. KVBlockZeroer derives each group's split ratio directly
+            # from its cache spec in that case.
+            num_blocks=(
+                None
+                if self.kv_cache_config.kv_cache_pools is not None
+                else self.kv_cache_config.num_blocks
+            ),
         )
 
     @torch.inference_mode()

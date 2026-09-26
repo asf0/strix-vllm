@@ -1623,6 +1623,54 @@ def test_heterogeneous_pools_reject_unsupported_kv_connector():
         )
 
 
+@pytest.mark.parametrize(
+    ("cache_dtype", "hidden_block_size", "pool_group_ids"),
+    [
+        ("int8_per_token_head", 544, [(0, 1, 2), (3,)]),
+        ("auto", 136, []),
+    ],
+)
+def test_hidden_state_export_pool_follows_kv_cache_quantization(
+    cache_dtype, hidden_block_size, pool_group_ids
+):
+    """Padding the BF16 export layer to a quantized verifier page would shrink
+    its block, so only then does it get a dedicated pool; unquantized export
+    keeps the legacy page-aligned shared pool."""
+    block_size = 544
+    full = FullAttentionSpec(
+        block_size=block_size, num_kv_heads=1, head_size=512, dtype=torch.bfloat16
+    )
+    mamba = MambaSpec(
+        block_size=block_size, shapes=((557056,),), dtypes=(torch.bfloat16,)
+    )
+    specs = {
+        **{f"full.{i}": full for i in range(4)},
+        **{f"mamba.{i}": mamba for i in range(6)},
+        "cache_only_layers.0": HiddenStateCacheSpec(
+            block_size=block_size, num_kv_heads=3, head_size=1024, dtype=torch.bfloat16
+        ),
+    }
+    vllm_config = VllmConfig(model_config=ModelConfig(max_model_len=2 * block_size))
+    vllm_config.cache_config.cache_dtype = cache_dtype
+    vllm_config.cache_config.kv_cache_layout = "LBNHC"
+    vllm_config.kv_transfer_config = SimpleNamespace(
+        kv_connector="ExampleHiddenStatesConnector"
+    )
+    vllm_config.speculative_config = SimpleNamespace(
+        method="extract_hidden_states",
+        use_eagle=lambda: False,
+        use_eagle_block_drop=lambda: False,
+    )
+
+    groups = get_kv_cache_groups(vllm_config, specs)
+    assert groups[-1].kv_cache_spec.block_size == hidden_block_size
+    config = kv_cache_planning.get_kv_cache_config_from_groups(
+        vllm_config, groups, available_memory=64 * 1024 * 1024
+    )
+    pools = config.kv_cache_pools or []
+    assert [pool.group_ids for pool in pools] == pool_group_ids
+
+
 def test_pipeline_parallel_rejects_different_heterogeneous_pool_layouts(
     monkeypatch,
 ):
