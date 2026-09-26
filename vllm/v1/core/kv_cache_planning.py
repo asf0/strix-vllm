@@ -44,6 +44,7 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
     compute_layout_strides,
+    is_quantized_kv_cache,
     iter_layer_specs,
     replace_as,
 )
@@ -808,13 +809,29 @@ def _is_hidden_states_export(vllm_config: VllmConfig) -> bool:
     extract_hidden_states speculative method qualifies. All other connectors
     must keep the heterogeneous-width NotImplementedError below.
     """
-    transfer_config = vllm_config.kv_transfer_config
     speculative_config = vllm_config.speculative_config
+    if (
+        speculative_config is None
+        or speculative_config.method != "extract_hidden_states"
+    ):
+        return False
+    transfer_config = vllm_config.kv_transfer_config
     return (
         transfer_config is not None
         and transfer_config.kv_connector == "ExampleHiddenStatesConnector"
-        and speculative_config is not None
-        and speculative_config.method == "extract_hidden_states"
+    )
+
+
+def _uses_dedicated_hidden_state_pool(vllm_config: VllmConfig) -> bool:
+    """Whether hidden-state export keeps its cache in a dedicated pool.
+
+    The exporter stores BF16 activations even when the verifier KV cache is
+    quantized. At long contexts, padding that wide layer to a quantized
+    verifier page shrinks its logical block to a few tokens, so it gets a
+    naturally sized group in its own physical pool instead.
+    """
+    return _is_hidden_states_export(vllm_config) and is_quantized_kv_cache(
+        vllm_config.cache_config.cache_dtype
     )
 
 
@@ -853,16 +870,24 @@ def get_kv_cache_config_from_groups(
         )
 
     layout = vllm_config.cache_config.get_resolved_kv_cache_layout()
-    validate_kv_cache_layout(layout, kv_cache_groups)
     group_widths = [_get_group_bytes_per_block(group) for group in kv_cache_groups]
     # Split into fixed-width physical pools only for groups the packing pass
     # deliberately padded (physical_bytes_per_block annotated); differing raw
     # page sums mean overlaying groups that share one pool, as upstream does.
-    uses_multiple_pools = (
-        any(group.physical_bytes_per_block is not None for group in kv_cache_groups)
-        and len({width for width in group_widths if width > 0}) > 1
+    has_mixed_widths = len({width for width in group_widths if width > 0}) > 1
+    uses_multiple_pools = has_mixed_widths and any(
+        group.physical_bytes_per_block is not None for group in kv_cache_groups
     )
-    if uses_multiple_pools and _is_hidden_states_export(vllm_config):
+    dedicated_hidden_state_pool = (
+        has_mixed_widths and _uses_dedicated_hidden_state_pool(vllm_config)
+    )
+    if dedicated_hidden_state_pool:
+        # ExampleHiddenStatesConnector receives block IDs for every cache
+        # group and only exports its dedicated hidden-state group. Unlike
+        # generic connectors, it is therefore safe to keep that BF16 output
+        # cache separate from the verifier's quantized KV pools.
+        uses_multiple_pools = True
+    elif uses_multiple_pools and _is_hidden_states_export(vllm_config):
         logger.warning(
             "Hidden-state export (ExampleHiddenStatesConnector + "
             "extract_hidden_states) forces the legacy single shared KV cache "
@@ -872,10 +897,21 @@ def get_kv_cache_config_from_groups(
         uses_multiple_pools = False
     if uses_multiple_pools:
         transfer_config = vllm_config.kv_transfer_config
-        if transfer_config is not None and transfer_config.kv_connector is not None:
+        if (
+            transfer_config is not None
+            and transfer_config.kv_connector is not None
+            and not dedicated_hidden_state_pool
+        ):
             raise NotImplementedError(
                 "KV connectors and KV offloading do not yet support "
                 "heterogeneous-width KV cache pools."
+            )
+        # Pools do not alias each other, so their pages only need to be
+        # expressible within that physical pool. This permits the exporter's
+        # BF16 hidden-state pages to use LBNHC independently of quantized KV.
+        for _width, group_ids in _get_physical_pool_groups(kv_cache_groups):
+            validate_kv_cache_layout(
+                layout, [kv_cache_groups[group_id] for group_id in group_ids]
             )
         # Pool widths are raw page sums, so no page may need stride padding.
         if any(
@@ -907,6 +943,7 @@ def get_kv_cache_config_from_groups(
         size = bytes_per_block * num_blocks
         kv_cache_pools = None
         group_to_pool = {group_id: 0 for group_id in range(len(kv_cache_groups))}
+        validate_kv_cache_layout(layout, kv_cache_groups)
 
     # Groups in the same physical pool alias that pool's starting offset.
     # Pools of different widths occupy disjoint arena regions. Spec regions
@@ -1465,8 +1502,12 @@ def get_kv_cache_groups(
         return fallback_groups
     groups = _get_kv_cache_groups_uniform_page_size(filtered_spec)
 
-    # Add hidden-state layers back with page aligned to the common page.
-    if hidden_specs:
+    if hidden_specs and _uses_dedicated_hidden_state_pool(vllm_config):
+        groups.extend(
+            KVCacheGroupSpec([name], spec) for name, spec in hidden_specs.items()
+        )
+    elif hidden_specs:
+        # Align hidden-state pages to the common page so they share its pool.
         common_page = get_uniform_page_size([g.kv_cache_spec for g in groups])
         # TP may shrink the common page below hidden-state per-token cost.
         groups, common_page = _ensure_min_page_size(groups, common_page, hidden_specs)
