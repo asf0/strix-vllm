@@ -37,10 +37,12 @@ class LaunchConfig:
     tile: int
     warps: int
     stages: int
+    waves_per_eu: int = 0  # 0: Triton default
 
     @property
     def name(self) -> str:
-        return f"M{self.block_m}_T{self.tile}_w{self.warps}_s{self.stages}"
+        name = f"M{self.block_m}_T{self.tile}_w{self.warps}_s{self.stages}"
+        return name + (f"_e{self.waves_per_eu}" if self.waves_per_eu else "")
 
 
 DEFAULT = None  # Production launch parameters, no override.
@@ -55,8 +57,7 @@ def parse_configs(args) -> list[LaunchConfig]:
     if args.configs:
         configs = []
         for spec in args.configs:
-            block_m, tile, warps, stages = (int(x) for x in spec.split(":"))
-            configs.append(LaunchConfig(block_m, tile, warps, stages))
+            configs.append(LaunchConfig(*(int(x) for x in spec.split(":"))))
         return configs
     return [
         LaunchConfig(*values)
@@ -107,6 +108,8 @@ class LaunchOverride:
                 num_warps=self.config.warps,
                 num_stages=self.config.stages,
             )
+            if self.config.waves_per_eu:
+                kwargs["waves_per_eu"] = self.config.waves_per_eu
             new_grid = (num_q_blocks + kwargs["num_seqs"], grid[1])
             return self.kernel[new_grid](**kwargs)
 
@@ -140,13 +143,18 @@ class Harness:
 
         # Block 0 is the null block; the rest are handed out shuffled, as
         # after the free list has churned.
-        num_blocks = math.ceil(max_tokens / bs) + 1
+        num_blocks = max(math.ceil(max_tokens / bs) + 1, args.num_blocks)
         order = torch.randperm(num_blocks - 1, generator=generator, device=device)
         self.block_table = (order + 1).to(torch.int32).unsqueeze(0)
         if args.contiguous_blocks:
             self.block_table = torch.arange(
                 1, num_blocks, dtype=torch.int32, device=device
             ).unsqueeze(0)
+        # Production pads rows to max_model_len blocks; the row stride's
+        # divisibility changes Triton's specialization.
+        if args.block_table_width > self.block_table.shape[1]:
+            pad = args.block_table_width - self.block_table.shape[1]
+            self.block_table = torch.nn.functional.pad(self.block_table, (0, pad))
 
         # LBNHC: one layer's region is (block, token, head, content). The
         # backend receives the logical (block, head, token, content) view.
@@ -157,9 +165,18 @@ class Harness:
             "auto": (torch.bfloat16, 2 * hs),
             "fp8": (torch.uint8, 2 * hs),
         }[args.kv_cache_dtype]
-        physical = torch.zeros(
-            num_blocks, bs, nkv, content, dtype=storage_dtype, device=device
-        )
+        shape = (num_blocks, bs, nkv, content)
+        physical = torch.zeros(shape, dtype=storage_dtype, device=device)
+        if args.pool_gib:
+            # Production views each layer out of one multi-GiB KV pool; the
+            # storage size (not the view) drives Triton's AMD specialization.
+            pool = torch.zeros(
+                int(args.pool_gib * 2**30), dtype=torch.uint8, device=device
+            )
+            start = int(args.kv_offset_gib * 2**30)
+            physical = (
+                pool[start : start + physical.nbytes].view(storage_dtype).view(shape)
+            )
         logical = physical.permute(0, 2, 1, 3)
         # Per-tensor FP8 scale sized so N(0, 1) data spans the FP8 range.
         self.kv_scale = torch.tensor(
@@ -449,7 +466,7 @@ def main() -> None:
     parser.add_argument(
         "--configs",
         nargs="+",
-        help="explicit BLOCK_M:TILE:WARPS:STAGES list instead of the grid",
+        help="BLOCK_M:TILE:WARPS:STAGES[:WAVES_PER_EU] list instead of the grid",
     )
     parser.add_argument(
         "--top-k",
@@ -468,6 +485,14 @@ def main() -> None:
         help="stop repeating a config once one call exceeds this",
     )
     parser.add_argument("--contiguous-blocks", action="store_true")
+    parser.add_argument("--num-blocks", type=int, default=0)
+    parser.add_argument("--kv-offset-gib", type=float, default=0)
+    parser.add_argument(
+        "--block-table-width", type=int, default=0, help="pad rows to this"
+    )
+    parser.add_argument(
+        "--pool-gib", type=float, default=0, help="carve the KV cache from a pool"
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--check", action="store_true")
     parser.add_argument("--check-depth", type=int, default=3001)

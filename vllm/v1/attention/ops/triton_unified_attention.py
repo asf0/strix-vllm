@@ -36,7 +36,8 @@ float8_info = torch.finfo(current_platform.fp8_dtype())
 # Longest per-request query (e.g. 1 + num_speculative_tokens) run by split-K.
 MAX_3D_QUERY_LEN = 8
 
-if current_platform.is_rocm():
+_ON_ROCM = current_platform.is_rocm()
+if _ON_ROCM:
     from vllm.platforms.rocm import on_gfx1151
 
     _ON_GFX1151 = on_gfx1151()
@@ -51,6 +52,34 @@ _GFX1151_PREFILL_LAUNCH = {
     KVQuantMode.INT8_PER_TOKEN_HEAD: (128, 32, 8),
     KVQuantMode.FP8_PER_TOKEN_HEAD: (64, 16, 4),
 }
+
+
+class _ViewPointer:
+    """A pointer argument that Triton sizes by its view, not its storage.
+
+    Triton's AMD backend uses 32-bit buffer loads only when an argument's
+    storage fits in 2 GiB. KV caches are views into one multi-GiB pool, so they
+    got 64-bit addressing and register spills (2.8x slower prefill attention on
+    gfx1151) although the kernel only indexes within the view.
+    """
+
+    def __init__(self, tensor: torch.Tensor):
+        self.tensor = tensor
+        self.dtype = tensor.dtype
+
+    def data_ptr(self) -> int:
+        return self.tensor.data_ptr()
+
+    def ptr_range(self) -> int:
+        shape, strides = self.tensor.shape, self.tensor.stride()
+        last = sum((size - 1) * stride for size, stride in zip(shape, strides))
+        return (last + 1) * self.tensor.element_size()
+
+
+def _kv_cache_arg(tensor: torch.Tensor | None) -> Any:
+    if not _ON_ROCM or tensor is None or tensor.numel() == 0:
+        return tensor
+    return _ViewPointer(tensor)
 
 
 @triton.jit
@@ -1143,8 +1172,8 @@ def unified_attention(
         vs_strides = v_scale_cache.stride()
         ks_blk, ks_slot, ks_head = ks_strides[0], ks_strides[1], ks_strides[2]
         vs_blk, vs_slot, vs_head = vs_strides[0], vs_strides[1], vs_strides[2]
-        k_scale_ptr = k_scale_cache
-        v_scale_ptr = v_scale_cache
+        k_scale_ptr = _kv_cache_arg(k_scale_cache)
+        v_scale_ptr = _kv_cache_arg(v_scale_cache)
     else:
         ks_blk = ks_slot = ks_head = None
         vs_blk = vs_slot = vs_head = None
@@ -1177,8 +1206,8 @@ def unified_attention(
         segm_max_ptr=segm_max_ptr,
         segm_expsum_ptr=segm_expsum_ptr,
         query_ptr=q,
-        key_cache_ptr=k,
-        value_cache_ptr=v,
+        key_cache_ptr=_kv_cache_arg(k),
+        value_cache_ptr=_kv_cache_arg(v),
         sink_ptr=sinks,
         block_tables_ptr=block_table,
         seq_lens_ptr=seqused_k,
