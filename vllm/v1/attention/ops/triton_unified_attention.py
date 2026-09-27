@@ -36,6 +36,22 @@ float8_info = torch.finfo(current_platform.fp8_dtype())
 # Longest per-request query (e.g. 1 + num_speculative_tokens) run by split-K.
 MAX_3D_QUERY_LEN = 8
 
+if current_platform.is_rocm():
+    from vllm.platforms.rocm import on_gfx1151
+
+    _ON_GFX1151 = on_gfx1151()
+else:
+    _ON_GFX1151 = False
+
+# gfx1151 (BLOCK_M, TILE_SIZE, num_warps) for head_size 256 multi-token queries,
+# the fastest single launch per KV mode over 16-8K-token queries.
+_GFX1151_PREFILL_LAUNCH = {
+    KVQuantMode.NONE: (128, 64, 8),
+    KVQuantMode.FP8_PER_TENSOR: (128, 32, 8),
+    KVQuantMode.INT8_PER_TOKEN_HEAD: (128, 32, 8),
+    KVQuantMode.FP8_PER_TOKEN_HEAD: (64, 16, 4),
+}
+
 
 @triton.jit
 def _cast_kv_tile(data, Q, tensor_scale, KV_QUANT_MODE: tl.constexpr):
@@ -54,6 +70,11 @@ def _cast_kv_tile(data, Q, tensor_scale, KV_QUANT_MODE: tl.constexpr):
         if Q.dtype.is_fp8():
             return data.to(Q.dtype)
         return (data.to(tl.float32) * tl.load(tensor_scale)).to(Q.dtype)
+    if KV_QUANT_MODE == 2:
+        # INT8 is exact in FP16/BF16, so truncation equals round-to-nearest
+        # and skips software RNE where there is no native BF16 convert: 2.4-3x
+        # faster INT8 attention on gfx1151. FP8's direct cast is already fast.
+        return data.to(tl.float32).to(Q.dtype, fp_downcast_rounding="rtz")
     return data.to(Q.dtype)
 
 
@@ -980,6 +1001,26 @@ def unified_attention(
         launch_num_warps = 8
         launch_num_stages = 2
 
+    # gfx1151: 16-row blocks re-read the whole KV prefix for every 2 query
+    # tokens (GQA 6), and software pipelining only adds LDS traffic. Wider
+    # query blocks with one stage are 3-13x faster for 256-8K-token queries
+    # over 32K context, and faster for 16-token queries too. Batch-invariant
+    # mode keeps the default launch, which does not depend on other requests.
+    gfx1151_launch = (
+        _GFX1151_PREFILL_LAUNCH.get(kv_quant_mode)
+        if _ON_GFX1151
+        and head_size == 256
+        and max_seqlen_q > 1
+        and num_queries_per_kv <= 16
+        and q.dtype in (torch.bfloat16, torch.float16)
+        and not is_batch_invariant
+        else None
+    )
+    if gfx1151_launch is not None:
+        BLOCK_M, _, launch_num_warps = gfx1151_launch
+        BLOCK_Q = BLOCK_M // num_queries_per_kv
+        launch_num_stages = 1
+
     # Ideally we would launch with kernel with:
     # \sum_i[ceil(query_len[i] / BLOCK_Q)] blocks.
     # However, it is slow to realize the query_lens on cpu.
@@ -1012,6 +1053,8 @@ def unified_attention(
     # path (used when max_seqlen_q > 1) reads TILE_SIZE_PREFILL.
     if tuned_large_head:
         TILE_SIZE_PREFILL = 128
+    elif gfx1151_launch is not None:
+        TILE_SIZE_PREFILL = gfx1151_launch[1]
 
     # USE_TD requires BLOCK_SIZE % TILE_SIZE == 0 (enforced by a
     # ``tl.static_assert`` in the kernel).  The default prefill tile

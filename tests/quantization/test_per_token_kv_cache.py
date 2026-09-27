@@ -526,10 +526,14 @@ def test_process_weights_sets_placeholder_scales(kv_cache_dtype: str):
     [
         [(1, 128)],
         [(1, 64), (1, 32)],
+        # Prefill after context; with head_size 256 on gfx1151 these take the
+        # tuned launch.
+        [(701, 3001)],
+        [(1500, 3600), (37, 1600)],
     ],
 )
-@pytest.mark.parametrize("num_heads", [(4, 4)])
-@pytest.mark.parametrize("head_size", [128])
+@pytest.mark.parametrize("num_heads", [(4, 4), (24, 4)])
+@pytest.mark.parametrize("head_size", [128, 256])
 @pytest.mark.parametrize("block_size", [16])
 @torch.inference_mode()
 def test_triton_unified_attention_per_token_head_scale(
