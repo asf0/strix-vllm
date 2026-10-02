@@ -2400,3 +2400,54 @@ def test_hidden_state_export_pool_follows_kv_cache_quantization(
     )
     pools = config.kv_cache_pools or []
     assert [pool.group_ids for pool in pools] == pool_group_ids
+
+
+def test_qwen35_mtp_draft_group_gets_narrow_pool():
+    """Qwen3.8-27B pads GDN state pages to the attention page, so its groups
+    come from the uniform-page path. The one-layer MTP group must get its own
+    one-page pool: overlaying the 16-wide target blocks spends a whole target
+    block per draft block and halves the attention KV capacity."""
+    page = 3_294_720
+    mamba = MambaSpec(
+        block_size=1_584,
+        shapes=((1,),),
+        dtypes=(torch.float16,),
+        page_size_padded=page,
+        num_speculative_blocks=2,
+    )
+    target = FullAttentionSpec(
+        block_size=1_584,
+        num_kv_heads=1,
+        head_size=1,
+        dtype=torch.uint8,
+        page_size_padded=page,
+    )
+    specs: dict[str, KVCacheSpec] = {}
+    for i in range(64):
+        if i % 4 == 3:
+            specs[f"model.layers.{i}.self_attn.attn"] = target
+        else:
+            specs[f"model.layers.{i}.linear_attn"] = mamba
+    specs["mtp.layers.0.self_attn.attn"] = replace(target, is_draft_kv_cache=True)
+    groups = get_kv_cache_groups(
+        _spec_decode_grouping_config(method="mtp", model_type="qwen3_5"), specs
+    )
+    vllm_config = VllmConfig(model_config=ModelConfig(max_model_len=24_576))
+    vllm_config.cache_config.kv_cache_layout = "BLHNC"
+
+    config = kv_cache_planning.get_kv_cache_config_from_groups(
+        vllm_config, groups, available_memory=1_000 * 16 * page
+    )
+
+    draft_id = next(
+        i
+        for i, group in enumerate(groups)
+        if group.layer_names == ["mtp.layers.0.self_attn.attn"]
+    )
+    assert config.kv_cache_pools is not None
+    assert [
+        (pool.group_ids, pool.bytes_per_block) for pool in config.kv_cache_pools
+    ] == [
+        (tuple(i for i in range(len(groups)) if i != draft_id), 16 * page),
+        ((draft_id,), page),
+    ]
