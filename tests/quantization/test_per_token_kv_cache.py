@@ -535,6 +535,8 @@ def test_process_weights_sets_placeholder_scales(kv_cache_dtype: str):
 @pytest.mark.parametrize("num_heads", [(4, 4), (24, 4)])
 @pytest.mark.parametrize("head_size", [128, 256])
 @pytest.mark.parametrize("block_size", [16])
+# 8 sends the decode-only cases through the 3D split-KV kernel.
+@pytest.mark.parametrize("seq_threshold_3D", [0, 8])
 @torch.inference_mode()
 def test_triton_unified_attention_per_token_head_scale(
     qcfg: QuantConfig,
@@ -542,6 +544,7 @@ def test_triton_unified_attention_per_token_head_scale(
     num_heads: tuple[int, int],
     head_size: int,
     block_size: int,
+    seq_threshold_3D: int,
 ):
     """End-to-end: quantized KV with per-token-head scale caches."""
     from vllm.utils.math_utils import next_power_of_2
@@ -650,7 +653,6 @@ def test_triton_unified_attention_per_token_head_scale(
     )
 
     head_size_padded = next_power_of_2(head_size)
-    seq_threshold_3D = 0
     num_par_softmax_segments = 16
     softmax_segm_output = torch.empty(
         (seq_threshold_3D, num_query_heads, num_par_softmax_segments, head_size_padded),
@@ -727,3 +729,130 @@ def test_triton_unified_attention_per_token_head_scale(
     else:
         atol, rtol = 5e-2, 5e-2
     torch.testing.assert_close(output_q, output_ref, atol=atol, rtol=rtol)
+
+
+@pytest.mark.parametrize(
+    "kv_cache_dtype", ["int8_per_token_head", "fp8_per_token_head"]
+)
+@pytest.mark.parametrize("head_size", [128, 256])
+@torch.inference_mode()
+def test_triton_unified_attention_pooled_per_token_head_decode(
+    monkeypatch: pytest.MonkeyPatch, kv_cache_dtype: str, head_size: int
+):
+    """Decode over the backend's inline-scale cache views, whole and split.
+
+    Each token-head record is K | k_scale | V | v_scale, so K / V rows are
+    only 8 / 4-byte aligned and V is read through K's pointer. Lowering the
+    32-bit buffer limit splits the views into pieces, the path ROCm takes for
+    KV views larger than 2 GiB; both must match the dequantized reference.
+    """
+    from vllm.v1.attention.backends.triton_attn import TritonAttentionImpl
+    from vllm.v1.attention.ops import triton_unified_attention as tua
+    from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
+        triton_reshape_and_cache_flash_per_token_head_quant,
+    )
+    from vllm.v1.kv_cache_interface import get_kv_quant_mode
+
+    torch.set_default_device(DEVICE_TYPE)
+    set_random_seed(0)
+    quant_mode = get_kv_quant_mode(kv_cache_dtype)
+    num_query_heads, num_kv_heads, block_size, num_blocks = 24, 4, 16, 512
+    kv_lens = [37, 300, 1001, 64]
+    num_seqs = len(kv_lens)
+
+    storage = (
+        torch.int8 if quant_mode == KVQuantMode.INT8_PER_TOKEN_HEAD else torch.uint8
+    )
+    physical = torch.zeros(
+        num_blocks, block_size, num_kv_heads, 2 * (head_size + 4), dtype=storage
+    )
+    impl = TritonAttentionImpl.__new__(TritonAttentionImpl)
+    impl._kv_quant_mode = quant_mode
+    impl.fp8_dtype = FP8_DTYPE
+    key_cache, value_cache = impl._pth_key_value_caches(physical.permute(0, 2, 1, 3))
+    k_scale_cache, v_scale_cache = impl._k_scale_cache, impl._v_scale_cache
+
+    max_blocks = max(kv_lens) // block_size + 1
+    block_table = (
+        (torch.randperm(num_blocks - 1)[: num_seqs * max_blocks] + 1)
+        .view(num_seqs, max_blocks)
+        .to(torch.int32)
+    )
+    for i, kv_len in enumerate(kv_lens):
+        pos = torch.arange(kv_len)
+        slots = block_table[i, pos // block_size].long() * block_size + pos % block_size
+        shape = (kv_len, num_kv_heads, head_size)
+        triton_reshape_and_cache_flash_per_token_head_quant(
+            torch.randn(shape, dtype=torch.bfloat16),
+            torch.randn(shape, dtype=torch.bfloat16),
+            key_cache,
+            value_cache,
+            k_scale_cache,
+            v_scale_cache,
+            slots,
+            kv_quant_mode=quant_mode,
+        )
+
+    query = torch.randn(num_seqs, num_query_heads, head_size, dtype=torch.bfloat16)
+    scale = head_size**-0.5
+    num_segments = 16
+    head_size_padded = 1 << (head_size - 1).bit_length()
+
+    def run() -> torch.Tensor:
+        out = torch.empty_like(query)
+        tua.unified_attention(
+            q=query,
+            k=key_cache,
+            v=value_cache,
+            out=out,
+            cu_seqlens_q=torch.arange(num_seqs + 1, dtype=torch.int32),
+            max_seqlen_q=1,
+            seqused_k=torch.tensor(kv_lens, dtype=torch.int32),
+            max_seqlen_k=max(kv_lens),
+            softmax_scale=scale,
+            causal=True,
+            window_size=(-1, -1),
+            block_table=block_table,
+            softcap=0,
+            q_descale=None,
+            k_descale=None,
+            v_descale=None,
+            seq_threshold_3D=8,
+            num_par_softmax_segments=num_segments,
+            softmax_segm_output=torch.empty(
+                8, num_query_heads, num_segments, head_size_padded
+            ),
+            softmax_segm_max=torch.empty(8, num_query_heads, num_segments),
+            softmax_segm_expsum=torch.empty(8, num_query_heads, num_segments),
+            kv_quant_mode=quant_mode,
+            k_scale_cache=k_scale_cache,
+            v_scale_cache=v_scale_cache,
+        )
+        return out
+
+    whole = run()
+    view_bytes = tua._ViewPointer(key_cache).ptr_range()
+    monkeypatch.setattr(tua, "_MAX_BUFFER_BYTES", view_bytes // 3)
+    if current_platform.is_rocm():
+        _, _, v_in_k = tua._kv_row_alignment(key_cache, value_cache)
+        caches = (key_cache, value_cache, k_scale_cache, v_scale_cache)
+        assert tua._kv_pieces(caches, v_in_k * key_cache.element_size())[0] > 1
+    split = run()
+
+    ref = torch.empty_like(query, dtype=torch.float32)
+    group = num_query_heads // num_kv_heads
+    for i, kv_len in enumerate(kv_lens):
+        pos = torch.arange(kv_len)
+        blocks, offs = block_table[i, pos // block_size].long(), pos % block_size
+        # The views are head_size + 4 wide: each half ends in its inline scale.
+        k = key_cache[blocks, offs, :, :head_size].float()
+        v = value_cache[blocks, offs, :, :head_size].float()
+        k = k * k_scale_cache[blocks, offs][..., None]
+        v = v * v_scale_cache[blocks, offs][..., None]
+        k = k.repeat_interleave(group, dim=1)
+        v = v.repeat_interleave(group, dim=1)
+        p = torch.einsum("hd,thd->ht", query[i].float(), k).mul(scale).softmax(-1)
+        ref[i] = torch.einsum("ht,thd->hd", p, v)
+
+    torch.testing.assert_close(whole.float(), ref, atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(split, whole, atol=0, rtol=0)

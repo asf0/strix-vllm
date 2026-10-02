@@ -7,6 +7,7 @@
 #  - Chih-Chieh Yang <chih.chieh.yang@ibm.com>
 #  - Thomas Parnell <tpa@zurich.ibm.com>
 
+import math
 from typing import Any
 
 import torch
@@ -37,6 +38,10 @@ float8_info = torch.finfo(current_platform.fp8_dtype())
 MAX_3D_QUERY_LEN = 8
 
 _ON_ROCM = current_platform.is_rocm()
+# Triton's AMD backend uses 32-bit buffer addressing for pointer arguments
+# whose range fits in this many bytes.
+_MAX_BUFFER_BYTES = 2**31 - 1
+_MAX_KV_PIECES = 4
 if _ON_ROCM:
     from vllm.platforms.rocm import on_gfx1151
 
@@ -53,6 +58,20 @@ _GFX1151_PREFILL_LAUNCH = {
     KVQuantMode.FP8_PER_TOKEN_HEAD: (64, 16, 4),
 }
 
+# gfx1151 split-KV decode (3D path) num_warps by (KV mode, head_size), for
+# whole KV views and for views split into pieces, with one pipeline stage
+# (two spill registers). Fastest over 8-32 seqs, 4K-20K context.
+_GFX1151_DECODE_WARPS = {
+    (KVQuantMode.NONE, 128): (2, 2),
+    (KVQuantMode.NONE, 256): (4, 4),
+    (KVQuantMode.FP8_PER_TENSOR, 128): (2, 2),
+    (KVQuantMode.FP8_PER_TENSOR, 256): (4, 4),
+    (KVQuantMode.INT8_PER_TOKEN_HEAD, 128): (2, 2),
+    (KVQuantMode.INT8_PER_TOKEN_HEAD, 256): (2, 4),
+    (KVQuantMode.FP8_PER_TOKEN_HEAD, 128): (2, 2),
+    (KVQuantMode.FP8_PER_TOKEN_HEAD, 256): (2, 4),
+}
+
 
 class _ViewPointer:
     """A pointer argument that Triton sizes by its view, not its storage.
@@ -63,9 +82,10 @@ class _ViewPointer:
     gfx1151) although the kernel only indexes within the view.
     """
 
-    def __init__(self, tensor: torch.Tensor):
+    def __init__(self, tensor: torch.Tensor, extra_bytes: int = 0):
         self.tensor = tensor
         self.dtype = tensor.dtype
+        self.extra_bytes = extra_bytes
 
     def data_ptr(self) -> int:
         return self.tensor.data_ptr()
@@ -73,13 +93,103 @@ class _ViewPointer:
     def ptr_range(self) -> int:
         shape, strides = self.tensor.shape, self.tensor.stride()
         last = sum((size - 1) * stride for size, stride in zip(shape, strides))
-        return (last + 1) * self.tensor.element_size()
+        return (last + 1) * self.tensor.element_size() + self.extra_bytes
 
 
-def _kv_cache_arg(tensor: torch.Tensor | None) -> Any:
+def _kv_row_alignment(
+    key_cache: torch.Tensor, value_cache: torch.Tensor
+) -> tuple[int, int, int]:
+    """Return (K_ALIGN, V_ALIGN, V_IN_K) for the kernel's KV row loads.
+
+    Triton only learns 16-byte alignment from arguments, so rows of layouts
+    aligned to less than that, such as per-token-head records with inline
+    scales (2 * (head_size + 4) bytes), were loaded one element at a time.
+    K_ALIGN / V_ALIGN are the element alignments of every head row start.
+    When V shares K's storage and only K's base is 16-byte aligned, V_IN_K is
+    V's element offset from K so V rows are addressed from K's base.
+    """
+    elem = key_cache.element_size()
+
+    def align(ptr: int, cache: torch.Tensor) -> int:
+        g = ptr
+        for stride in cache.stride()[:3]:
+            g = math.gcd(g, stride * elem)
+        return max(min(g & -g, 16) // elem, 1)
+
+    k_ptr, v_ptr = key_cache.data_ptr(), value_cache.data_ptr()
+    v_in_k = -1
+    if (
+        k_ptr % 16 == 0
+        and v_ptr % 16 != 0
+        and v_ptr >= k_ptr
+        and (v_ptr - k_ptr) % elem == 0
+        and value_cache.dtype == key_cache.dtype
+        and value_cache.stride() == key_cache.stride()
+    ):
+        v_in_k = (v_ptr - k_ptr) // elem
+    return align(k_ptr, key_cache), align(v_ptr, value_cache), v_in_k
+
+
+def _kv_cache_arg(tensor: torch.Tensor | None, extra_bytes: int = 0) -> Any:
     if not _ON_ROCM or tensor is None or tensor.numel() == 0:
         return tensor
-    return _ViewPointer(tensor)
+    return _ViewPointer(tensor, extra_bytes)
+
+
+def _kv_pieces(
+    caches: tuple[torch.Tensor | None, ...], k_extra_bytes: int
+) -> tuple[int, int]:
+    """Split KV cache views into block ranges that fit 32-bit addressing.
+
+    Returns (number of pieces, blocks per piece); (1, 0) when no view exceeds
+    the buffer range or more than ``_MAX_KV_PIECES`` pieces would be needed.
+    """
+    extras = (k_extra_bytes,) + (0,) * (len(caches) - 1)
+
+    def fits(num_blocks: int) -> bool:
+        # Bytes addressed through ``cache[lo : lo + num_blocks]``.
+        for cache, extra in zip(caches, extras):
+            if cache is None:
+                continue
+            shape = (num_blocks, *cache.shape[1:])
+            last = sum((n - 1) * st for n, st in zip(shape, cache.stride()))
+            if (last + 1) * cache.element_size() + extra > _MAX_BUFFER_BYTES:
+                return False
+        return True
+
+    num_blocks = caches[0].shape[0]
+    if fits(num_blocks):
+        return 1, 0
+    for pieces in range(2, _MAX_KV_PIECES + 1):
+        per_piece = -(-num_blocks // pieces)
+        if fits(per_piece):
+            return -(-num_blocks // per_piece), per_piece
+    return 1, 0
+
+
+@triton.jit
+def _load_kv_tile(
+    ptrs, offsets, masks, V_IN_K: tl.constexpr, USE_PER_TOKEN_HEAD_SCALES: tl.constexpr
+):
+    """Load K (HEAD_SIZE, TILE_SIZE), V (TILE_SIZE, HEAD_SIZE) and scales.
+
+    ptrs / offsets: (K, V, K scales, V scales); masks: (K, V, tile).
+    """
+    k_ptr, v_ptr, ks_ptr, vs_ptr = ptrs
+    k_offset, v_offset, ks_offset, vs_offset = offsets
+    k_mask, v_mask, tile_mask = masks
+    K_load = tl.load(k_ptr + k_offset, mask=k_mask, other=0.0)
+    if V_IN_K >= 0:
+        V_load = tl.load(k_ptr + (v_offset + V_IN_K), mask=v_mask, other=0.0)
+    else:
+        V_load = tl.load(v_ptr + v_offset, mask=v_mask, other=0.0)
+    if USE_PER_TOKEN_HEAD_SCALES:
+        k_scales = tl.load(ks_ptr + ks_offset, mask=tile_mask, other=1.0)
+        v_scales = tl.load(vs_ptr + vs_offset, mask=tile_mask, other=1.0)
+    else:
+        k_scales = tile_mask.to(tl.float32)
+        v_scales = k_scales
+    return K_load, V_load, k_scales, v_scales
 
 
 @triton.jit
@@ -341,6 +451,16 @@ def kernel_unified_attention(
     # instead of letting them override it. Default False preserves the
     # original (causal AND SW) OR mm_prefix behavior for all other models.
     MM_PREFIX_CLAMP_SW: tl.constexpr = False,
+    # See ``_kv_row_alignment``.
+    K_ALIGN: tl.constexpr = 1,
+    V_ALIGN: tl.constexpr = 1,
+    V_IN_K: tl.constexpr = -1,
+    # KV_PIECES > 1: the KV views are split into pieces of kv_piece_blocks
+    # blocks, ``kv_pieces[i] = (K, V, K scales, V scales)``, each small enough
+    # for 32-bit addressing.
+    KV_PIECES: tl.constexpr = 1,
+    kv_piece_blocks=0,
+    kv_pieces=None,
 ):
     # Per-(token, head) scale caches: used iff KV_QUANT_MODE in {2, 3}.
     USE_PER_TOKEN_HEAD_SCALES: tl.constexpr = (KV_QUANT_MODE >= 2) and (
@@ -473,14 +593,64 @@ def kernel_unified_attention(
         seq_idx,
     )
 
+    # Rounding the strides to the known row alignment lets the compiler prove
+    # it and vectorize the KV loads; the values are unchanged.
+    sk0 = stride_k_cache_0 // K_ALIGN * K_ALIGN
+    sk1 = stride_k_cache_1 // K_ALIGN * K_ALIGN
+    sk2 = stride_k_cache_2 // K_ALIGN * K_ALIGN
+    sv0 = stride_v_cache_0 // V_ALIGN * V_ALIGN
+    sv1 = stride_v_cache_1 // V_ALIGN * V_ALIGN
+    sv2 = stride_v_cache_2 // V_ALIGN * V_ALIGN
+
     # iterate through tiles (now limited to the sliding window range)
     for j in range(loop_lo, loop_hi):
         seq_offset = j * TILE_SIZE + offs_t
         tile_mask = seq_offset < max_seq_prefix_len
 
-        physical_block_idx = tl.load(
-            block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE
-        ).to(tl.int64)
+        if KV_PIECES > 1:
+            # Tiles never straddle a block, so each one is addressed inside
+            # the piece of the KV views that holds its block.
+            block = tl.load(
+                block_tables_ptr + block_table_offset + (j * TILE_SIZE) // BLOCK_SIZE
+            )
+            piece = block // kv_piece_blocks
+            physical_block_idx = tl.zeros([TILE_SIZE], dtype=tl.int64) + (
+                block - piece * kv_piece_blocks
+            ).to(tl.int64)
+        else:
+            physical_block_idx = tl.load(
+                block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE
+            ).to(tl.int64)
+
+        slot = seq_offset % BLOCK_SIZE
+        k_offset = (
+            physical_block_idx[None, :] * sk0
+            + kv_head_idx * sk2
+            + offs_d[:, None] * stride_k_cache_3
+            + slot[None, :] * sk1
+        )
+        v_offset = (
+            physical_block_idx[:, None] * sv0
+            + kv_head_idx * sv2
+            + offs_d[None, :] * stride_v_cache_3
+            + slot[:, None] * sv1
+        )
+        k_mask = dim_mask[:, None] & tile_mask[None, :]
+        v_mask = dim_mask[None, :] & tile_mask[:, None]
+        if USE_PER_TOKEN_HEAD_SCALES:
+            ks_offset = (
+                physical_block_idx * stride_ks_blk
+                + slot * stride_ks_slot
+                + kv_head_idx * stride_ks_head
+            )
+            vs_offset = (
+                physical_block_idx * stride_vs_blk
+                + slot * stride_vs_slot
+                + kv_head_idx * stride_vs_head
+            )
+        else:
+            ks_offset = slot
+            vs_offset = slot
 
         if USE_TD:
             # All TILE_SIZE slots within a single KV tile map to one
@@ -521,52 +691,49 @@ def kernel_unified_attention(
                 HEAD_SIZE,
                 HEAD_SIZE_PADDED,
             )
+            k_token_head_scales = tile_mask.to(tl.float32)
+            v_token_head_scales = k_token_head_scales
+            if USE_PER_TOKEN_HEAD_SCALES:
+                k_token_head_scales = tl.load(
+                    k_scale_cache_ptr + ks_offset, mask=tile_mask, other=1.0
+                )
+                v_token_head_scales = tl.load(
+                    v_scale_cache_ptr + vs_offset, mask=tile_mask, other=1.0
+                )
         else:
-            v_offset = (
-                physical_block_idx[:, None] * stride_v_cache_0
-                + kv_head_idx * stride_v_cache_2
-                + offs_d[None, :] * stride_v_cache_3
-                + (seq_offset % BLOCK_SIZE)[:, None] * stride_v_cache_1
-            )
-            k_offset = (
-                physical_block_idx[None, :] * stride_k_cache_0
-                + kv_head_idx * stride_k_cache_2
-                + offs_d[:, None] * stride_k_cache_3
-                + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
-            )
-            # K : (HEAD_SIZE, TILE_SIZE)
-            K_load = tl.load(
-                key_cache_ptr + k_offset,
-                mask=dim_mask[:, None] & tile_mask[None, :],
-                other=0.0,
-            )
-            # V : (TILE_SIZE, HEAD_SIZE)
-            V_load = tl.load(
-                value_cache_ptr + v_offset,
-                mask=dim_mask[None, :] & tile_mask[:, None],
-                other=0.0,
-            )
+            offsets = (k_offset, v_offset, ks_offset, vs_offset)
+            masks = (k_mask, v_mask, tile_mask)
+            if KV_PIECES == 1:
+                # Scale pointers are None without per-token-head scales and
+                # Triton tuples cannot hold None; K / V stand in, unread.
+                if USE_PER_TOKEN_HEAD_SCALES:
+                    ptrs = (key_cache_ptr, value_cache_ptr)
+                    ptrs += (k_scale_cache_ptr, v_scale_cache_ptr)
+                else:
+                    ptrs = (key_cache_ptr, value_cache_ptr)
+                    ptrs += (key_cache_ptr, value_cache_ptr)
+                tile = _load_kv_tile(
+                    ptrs, offsets, masks, V_IN_K, USE_PER_TOKEN_HEAD_SCALES
+                )
+            elif piece == 0:
+                tile = _load_kv_tile(
+                    kv_pieces[0], offsets, masks, V_IN_K, USE_PER_TOKEN_HEAD_SCALES
+                )
+            elif KV_PIECES == 2 or piece == 1:
+                tile = _load_kv_tile(
+                    kv_pieces[1], offsets, masks, V_IN_K, USE_PER_TOKEN_HEAD_SCALES
+                )
+            elif KV_PIECES == 3 or piece == 2:
+                tile = _load_kv_tile(
+                    kv_pieces[2], offsets, masks, V_IN_K, USE_PER_TOKEN_HEAD_SCALES
+                )
+            else:
+                tile = _load_kv_tile(
+                    kv_pieces[3], offsets, masks, V_IN_K, USE_PER_TOKEN_HEAD_SCALES
+                )
+            K_load, V_load, k_token_head_scales, v_token_head_scales = tile
         K = _cast_kv_tile(K_load, Q, k_scale, KV_QUANT_MODE)
         V = _cast_kv_tile(V_load, Q, v_scale, KV_QUANT_MODE)
-
-        # Per-(token, head) scales for INT8 / FP8 per-token-head modes.
-        if USE_PER_TOKEN_HEAD_SCALES:
-            scale_idx = (
-                physical_block_idx * stride_ks_blk
-                + (seq_offset % BLOCK_SIZE) * stride_ks_slot
-                + kv_head_idx * stride_ks_head
-            )
-            k_token_head_scales = tl.load(
-                k_scale_cache_ptr + scale_idx, mask=tile_mask, other=1.0
-            )
-            v_scale_idx = (
-                physical_block_idx * stride_vs_blk
-                + (seq_offset % BLOCK_SIZE) * stride_vs_slot
-                + kv_head_idx * stride_vs_head
-            )
-            v_token_head_scales = tl.load(
-                v_scale_cache_ptr + v_scale_idx, mask=tile_mask, other=1.0
-            )
 
         query_abs_pos = context_len + query_pos[:, None]
         seq_mask = compute_kv_seq_mask(
@@ -1194,6 +1361,34 @@ def unified_attention(
         grid = (total_num_q_blocks, num_kv_heads, num_par_softmax_segments)
         tile_size = TILE_SIZE_DECODE
 
+    k_align, v_align, v_in_k = _kv_row_alignment(k, v)
+    # V rows read through K's pointer extend the range addressed from it.
+    k_extra_bytes = v_in_k * k.element_size() if v_in_k >= 0 else 0
+
+    num_kv_pieces, kv_piece_blocks, kv_pieces = 1, 0, None
+    if _ON_ROCM and not use_td and block_size % tile_size == 0:
+        num_kv_pieces, kv_piece_blocks = _kv_pieces(
+            (k, v, k_scale_cache, v_scale_cache), k_extra_bytes
+        )
+    if num_kv_pieces > 1:
+        extras = (k_extra_bytes, 0, 0, 0)
+        kv_pieces = tuple(
+            tuple(
+                None if c is None else _kv_cache_arg(c[lo : lo + kv_piece_blocks], e)
+                for c, e in zip((k, v, k_scale_cache, v_scale_cache), extras)
+            )
+            for lo in range(0, k.shape[0], kv_piece_blocks)
+        )
+
+    gfx1151_decode_warps = (
+        _GFX1151_DECODE_WARPS.get((kv_quant_mode, head_size))
+        if use_3d and _ON_GFX1151 and q.dtype in (torch.bfloat16, torch.float16)
+        else None
+    )
+    if gfx1151_decode_warps is not None:
+        launch_num_warps = gfx1151_decode_warps[num_kv_pieces > 1]
+        launch_num_stages = 1
+
     launch_kwargs: dict[str, int] = {}
     if launch_num_warps is not None:
         launch_kwargs["num_warps"] = launch_num_warps
@@ -1206,7 +1401,7 @@ def unified_attention(
         segm_max_ptr=segm_max_ptr,
         segm_expsum_ptr=segm_expsum_ptr,
         query_ptr=q,
-        key_cache_ptr=_kv_cache_arg(k),
+        key_cache_ptr=_kv_cache_arg(k, k_extra_bytes),
         value_cache_ptr=_kv_cache_arg(v),
         sink_ptr=sinks,
         block_tables_ptr=block_table,
@@ -1276,6 +1471,12 @@ def unified_attention(
         USE_TD=use_td,
         USE_TD_QO=use_td_qo,
         MM_PREFIX_CLAMP_SW=mm_prefix_clamp_sliding_window,
+        K_ALIGN=k_align,
+        V_ALIGN=v_align,
+        V_IN_K=v_in_k,
+        KV_PIECES=num_kv_pieces,
+        kv_piece_blocks=kv_piece_blocks,
+        kv_pieces=kv_pieces,
         **launch_kwargs,
     )
 
