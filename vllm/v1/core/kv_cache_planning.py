@@ -548,17 +548,20 @@ def _get_kv_cache_groups_uniform_page_size(
     for group, layer_names in zip(groups, grouped_layers):
         if len(layer_names) == group_size or not layer_names:
             continue
-        if all(
-            isinstance(spec, FullAttentionSpec) and spec.is_draft_kv_cache
-            for spec in iter_layer_specs(group.kv_cache_spec)
-        ):
-            continue
         first_page = _get_per_layer_spec(group, layer_names[0]).page_size_bytes
         assert all(
             _get_per_layer_spec(group, layer_name).page_size_bytes == first_page
             for layer_name in layer_names
         )
-        group.physical_bytes_per_block = group_size * first_page
+        # A drafter group keeps its own width, so it gets a narrow physical
+        # pool instead of overlaying full-width blocks it barely uses.
+        group_layers = group_size
+        if all(
+            isinstance(spec, FullAttentionSpec) and spec.is_draft_kv_cache
+            for spec in iter_layer_specs(group.kv_cache_spec)
+        ):
+            group_layers = len(layer_names)
+        group.physical_bytes_per_block = group_layers * first_page
     return groups
 
 
