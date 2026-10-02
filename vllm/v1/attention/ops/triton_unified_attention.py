@@ -42,6 +42,9 @@ _ON_ROCM = current_platform.is_rocm()
 # whose range fits in this many bytes.
 _MAX_BUFFER_BYTES = 2**31 - 1
 _MAX_KV_PIECES = 4
+# Largest q-block (query tokens x queries per KV head) for multi-token queries
+# on the split-KV (3D) path.
+MAX_3D_BLOCK_M = 64
 if _ON_ROCM:
     from vllm.platforms.rocm import on_gfx1151
 
@@ -70,6 +73,16 @@ _GFX1151_DECODE_WARPS = {
     (KVQuantMode.INT8_PER_TOKEN_HEAD, 256): (2, 4),
     (KVQuantMode.FP8_PER_TOKEN_HEAD, 128): (2, 2),
     (KVQuantMode.FP8_PER_TOKEN_HEAD, 256): (2, 4),
+}
+
+# gfx1151 split-KV num_warps for head_size 256 multi-token queries
+# (speculative-decoding verification), for 32- and 64-row q-blocks. Fewer warps
+# spill the larger accumulator. Measured over 32 seqs, 16K context.
+_GFX1151_VERIFY_WARPS = {
+    KVQuantMode.NONE: (4, 8),
+    KVQuantMode.FP8_PER_TENSOR: (4, 8),
+    KVQuantMode.INT8_PER_TOKEN_HEAD: (8, 8),
+    KVQuantMode.FP8_PER_TOKEN_HEAD: (8, 8),
 }
 
 
@@ -1177,10 +1190,6 @@ def unified_attention(
     )
     BLOCK_Q = BLOCK_M // num_queries_per_kv
 
-    # Tuned launch parameters; ``None`` lets Triton pick its defaults.
-    launch_num_warps: int | None = None
-    launch_num_stages: int | None = None
-
     # head_size 256 with many query rows per sequence (e.g. diffusion-gemma
     # bidirectional canvas passes) is prefill-shaped, but the decode-oriented
     # defaults (BLOCK_Q=8, TILE=32, 4 warps) under-tile it. A wider KV tile +
@@ -1191,6 +1200,50 @@ def unified_attention(
         and num_queries_per_kv <= 16
         and current_platform.is_device_capability_family(100)
     )
+
+    # Launch the 2D kernel if
+    # 1. No split-K threshold or scratch buffers, or the scratch has fewer
+    #    rows than query tokens, or
+    # 2. max_seqlen_q > 1 and either it exceeds MAX_3D_QUERY_LEN or one 3D
+    #    q-block, masking is non-causal, per-sequence causal, or mm-prefix, or
+    #    the tuned large-head path applies, or
+    # 3. The number of sequences exceeds the configured threshold, or
+    # 4. Batch invariance is enabled
+    # Short multi-token queries (speculative-decoding verification) take the 3D
+    # path with one q-block per sequence, so each KV tile is read once.
+    use_3d = not (
+        seq_threshold_3D is None
+        or num_par_softmax_segments is None
+        or softmax_segm_output is None
+        or softmax_segm_max is None
+        or softmax_segm_expsum is None
+        or (
+            max_seqlen_q > 1
+            and (
+                max_seqlen_q > MAX_3D_QUERY_LEN
+                or max_seqlen_q * num_queries_per_kv > MAX_3D_BLOCK_M
+                or not use_causal
+                or use_per_seq_causal
+                or use_mm_prefix
+                or tuned_large_head
+            )
+        )
+        or num_seqs > seq_threshold_3D
+        or is_batch_invariant
+    )
+    if use_3d and softmax_segm_max.shape[0] < q.shape[0]:
+        logger.debug_once("Split-K scratch rows < query tokens; using 2D.")
+        use_3d = False
+    if use_3d and max_seqlen_q > 1:
+        BLOCK_M = max(
+            BLOCK_M, triton.next_power_of_2(max_seqlen_q * num_queries_per_kv)
+        )
+        BLOCK_Q = BLOCK_M // num_queries_per_kv
+
+    # Tuned launch parameters; ``None`` lets Triton pick its defaults.
+    launch_num_warps: int | None = None
+    launch_num_stages: int | None = None
+
     if tuned_large_head:
         BLOCK_M = 32
         BLOCK_Q = BLOCK_M // num_queries_per_kv
@@ -1207,6 +1260,7 @@ def unified_attention(
         if _ON_GFX1151
         and head_size == 256
         and max_seqlen_q > 1
+        and not use_3d
         and num_queries_per_kv <= 16
         and q.dtype in (torch.bfloat16, torch.float16)
         and not is_batch_invariant
@@ -1298,37 +1352,6 @@ def unified_attention(
             f"(out.stride(1) = {out.stride(1)} != head_size = {head_size})."
         )
 
-    # Launch the 2D kernel if
-    # 1. No split-K threshold or scratch buffers, or the scratch has fewer
-    #    rows than query tokens, or
-    # 2. max_seqlen_q > 1 and either it exceeds MAX_3D_QUERY_LEN, masking is
-    #    non-causal, per-sequence causal, or mm-prefix, or the tuned
-    #    large-head path applies, or
-    # 3. The number of Q blocks exceeds seq_threshold_3D, or
-    # 4. Batch invariance is enabled
-    use_3d = not (
-        seq_threshold_3D is None
-        or num_par_softmax_segments is None
-        or softmax_segm_output is None
-        or softmax_segm_max is None
-        or softmax_segm_expsum is None
-        or (
-            max_seqlen_q > 1
-            and (
-                max_seqlen_q > MAX_3D_QUERY_LEN
-                or not use_causal
-                or use_per_seq_causal
-                or use_mm_prefix
-                or tuned_large_head
-            )
-        )
-        or num_seqs * triton.cdiv(max_seqlen_q, BLOCK_Q) > seq_threshold_3D
-        or is_batch_invariant
-    )
-    if use_3d and softmax_segm_max.shape[0] < q.shape[0]:
-        logger.debug_once("Split-K scratch rows < query tokens; using 2D.")
-        use_3d = False
-
     # The kernel signature is the same for 2D and 3D — only the launch
     # grid + a handful of constexpr toggles differ.  Per-token-head scale
     # caches and their strides are passed as ``None`` when the
@@ -1388,6 +1411,9 @@ def unified_attention(
     if gfx1151_decode_warps is not None:
         launch_num_warps = gfx1151_decode_warps[num_kv_pieces > 1]
         launch_num_stages = 1
+        if head_size == 256 and BLOCK_M > 16:
+            verify_warps = _GFX1151_VERIFY_WARPS[kv_quant_mode]
+            launch_num_warps = verify_warps[BLOCK_M > 32]
 
     launch_kwargs: dict[str, int] = {}
     if launch_num_warps is not None:

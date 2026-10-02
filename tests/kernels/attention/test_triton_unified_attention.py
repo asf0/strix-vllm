@@ -654,6 +654,113 @@ def test_triton_unified_attn_clamped_mm_matches_dense_reference() -> None:
 
 
 @pytest.mark.parametrize(
+    "seq_lens",
+    [[(3, 1328), (3, 18), (2, 257), (3, 2011)], [(8, 523), (4, 37), (8, 257)]],
+)
+@pytest.mark.parametrize("num_heads", NUM_HEADS)
+@pytest.mark.parametrize("head_size", HEAD_SIZES)
+@pytest.mark.parametrize("sliding_window", [None, 64])
+@torch.inference_mode()
+def test_triton_unified_attn_multi_token_3d(
+    seq_lens: list[tuple[int, int]],
+    num_heads: tuple[int, int],
+    head_size: int,
+    sliding_window: int | None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Speculative-decoding verification batches (a few query tokens per
+    sequence) take the split-KV path when the segment buffers hold every query
+    token. KV length 257 leaves only the last key in the last segment, so the
+    other query rows see no keys there."""
+    import vllm.v1.attention.ops.triton_unified_attention as tua
+
+    torch.set_default_device(DEVICE_TYPE)
+    set_random_seed(0)
+    reduce_grids = []
+    reduce_segments = tua.reduce_segments
+
+    class ReduceSpy:
+        def __getitem__(self, grid):
+            reduce_grids.append(grid)
+            return reduce_segments[grid]
+
+    monkeypatch.setattr(tua, "reduce_segments", ReduceSpy())
+
+    num_seqs = len(seq_lens)
+    query_lens = [x[0] for x in seq_lens]
+    kv_lens_list = [x[1] for x in seq_lens]
+    num_query_heads, num_kv_heads = num_heads
+    block_size, num_blocks, num_segments = 16, 2048, 16
+    window_size = (sliding_window - 1, 0) if sliding_window is not None else (-1, -1)
+    scale = head_size**-0.5
+
+    query = torch.randn(
+        sum(query_lens), num_query_heads, head_size, dtype=torch.bfloat16
+    )
+    key_cache = torch.randn(
+        num_blocks, block_size, num_kv_heads, head_size, dtype=torch.bfloat16
+    )
+    value_cache = torch.randn_like(key_cache)
+    cu_query_lens = torch.tensor([0] + query_lens, dtype=torch.int32).cumsum(
+        dim=0, dtype=torch.int32
+    )
+    kv_lens = torch.tensor(kv_lens_list, dtype=torch.int32)
+    block_tables = torch.randint(
+        0,
+        num_blocks,
+        (num_seqs, -(-max(kv_lens_list) // block_size)),
+        dtype=torch.int32,
+    )
+    head_size_padded = next_power_of_2(head_size)
+    num_tokens = query.shape[0]
+    output = torch.empty_like(query)
+
+    unified_attention(
+        q=query,
+        k=key_cache,
+        v=value_cache,
+        out=output,
+        cu_seqlens_q=cu_query_lens,
+        seqused_k=kv_lens,
+        max_seqlen_q=max(query_lens),
+        max_seqlen_k=max(kv_lens_list),
+        softmax_scale=scale,
+        causal=True,
+        window_size=window_size,
+        block_table=block_tables,
+        softcap=0,
+        q_descale=None,
+        k_descale=None,
+        v_descale=None,
+        seq_threshold_3D=num_seqs,
+        num_par_softmax_segments=num_segments,
+        softmax_segm_output=torch.empty(
+            (num_tokens, num_query_heads, num_segments, head_size_padded),
+            dtype=torch.float32,
+        ),
+        softmax_segm_max=torch.empty(
+            (num_tokens, num_query_heads, num_segments), dtype=torch.float32
+        ),
+        softmax_segm_expsum=torch.empty(
+            (num_tokens, num_query_heads, num_segments), dtype=torch.float32
+        ),
+    )
+
+    assert reduce_grids, "multi-token batch did not take the 3D path"
+    ref_output = ref_paged_attn(
+        query=query,
+        key_cache=key_cache,
+        value_cache=value_cache,
+        query_lens=query_lens,
+        kv_lens=kv_lens_list,
+        block_tables=block_tables,
+        scale=scale,
+        sliding_window=sliding_window,
+    )
+    torch.testing.assert_close(output, ref_output, atol=1.5e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize(
     "seq_lens", [[(1, 1328), (5, 18), (129, 463)], [(1, 523), (1, 37), (1, 2011)]]
 )
 @pytest.mark.parametrize("num_heads", NUM_HEADS)
