@@ -61,6 +61,7 @@ from vllm.model_executor.layers.mamba.ops.gdn_prefill_conv import (
     gdn_prefill_conv,
     gdn_prefill_conv_supported,
 )
+from vllm.model_executor.layers.mamba.ops.gdn_recoverssm import gdn_recoverssm_verify
 from vllm.model_executor.layers.mamba.ops.hip_gdn_chunk import (
     chunk_gdn_hip_fwd,
     is_hip_gdn_available,
@@ -709,10 +710,8 @@ class ChunkGatedDeltaRule(CustomOp):
 
 @PluggableLayer.register("qwen_gated_delta_net_attention")
 class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
-    def get_state_shape(
-        self,
-    ) -> tuple[tuple[int, ...], ...]:
-        return MambaStateShapeCalculator.gated_delta_net_state_shape(
+    def get_state_shape(self) -> tuple[tuple[int, ...], ...]:
+        shapes = MambaStateShapeCalculator.gated_delta_net_state_shape(
             self.tp_size,
             self.num_k_heads,
             self.num_v_heads,
@@ -722,16 +721,32 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             self.num_spec,
             self.cache_config.replayssm_buffer_len
             if self.cache_config.use_replayssm
+            and not self.cache_config.use_gdn_recoverssm
             else None,
         )
+        if self.cache_config.use_gdn_recoverssm:
+            return MambaStateShapeCalculator.append_gdn_recoverssm_records(
+                shapes,
+                self.tp_size,
+                self.num_k_heads,
+                self.num_v_heads,
+                self.head_k_dim,
+                self.head_v_dim,
+                spec_query_len=1 + self.num_spec,
+            )
+        return shapes
 
     def get_state_dtype(self) -> tuple[torch.dtype, ...]:
-        return MambaStateDtypeCalculator.gated_delta_net_state_dtype(
+        dtypes = MambaStateDtypeCalculator.gated_delta_net_state_dtype(
             self.model_config.dtype,
             self.cache_config.mamba_cache_dtype,
             self.cache_config.mamba_ssm_cache_dtype,
-            self.cache_config.use_replayssm,
+            self.cache_config.use_replayssm
+            and not self.cache_config.use_gdn_recoverssm,
         )
+        if self.cache_config.use_gdn_recoverssm:
+            return MambaStateDtypeCalculator.append_gdn_recoverssm_records(dtypes)
+        return dtypes
 
     def __init__(
         self,
@@ -754,6 +769,12 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         )
         if self.beta_scale != 1.0 and current_platform.is_cpu():
             raise NotImplementedError("Scaled GDN beta requires the Triton kernels.")
+        self.use_recoverssm = self.cache_config.use_gdn_recoverssm
+        self.use_replayssm = self.cache_config.use_replayssm and not self.use_recoverssm
+        if self.use_recoverssm and self.beta_scale != 1.0:
+            raise ValueError(
+                "GDN RecoverSSM does not support scaled beta (linear_allow_neg_eigval)"
+            )
         if norm_eps is not None:
             self.layer_norm_epsilon = norm_eps
 
@@ -947,7 +968,6 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         # Cached-decode kernel (reuses the engine-level mamba_* flags). When
         # enabled, the paged GDN page grows to 5 tensors and the non-spec decode
         # branch decodes through fused_recurrent_gated_delta_rule_replayssm.
-        self.use_replayssm = self.cache_config.use_replayssm
         if self.use_replayssm and (
             reason := self._replayssm_unsupported_reason(vllm_config, self.beta_scale)
         ):
@@ -985,7 +1005,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
     def _aiter_fused_gdn_decode_unsupported_reason(
         self, vllm_config: VllmConfig
     ) -> str | None:
-        if self.cache_config.use_replayssm:
+        if self.use_replayssm:
             return "ReplaySSM decodes through its own kernel"
         conv_state_dtype, recurrent_state_dtype = self.get_state_dtype()[:2]
         if (
@@ -2060,7 +2080,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 ],
                 num_accepted_tokens=num_accepted_tokens,
                 query_start_loc=spec_query_start_loc,
-                max_query_len=spec_state_indices_tensor.size(-1),
+                max_query_len=(
+                    self.num_spec + 1
+                    if self.use_recoverssm
+                    else spec_state_indices_tensor.size(-1)
+                ),
                 validate_data=False,
             )
 
@@ -2197,7 +2221,27 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         # 2. Recurrent attention
 
         # 2.1: Process the multi-query part
-        if spec_sequence_masks is not None:
+        if spec_sequence_masks is not None and self.use_recoverssm:
+            assert spec_query_start_loc is not None
+            assert spec_state_indices_tensor is not None
+            num_spec_decodes = attn_metadata.num_spec_decodes
+            core_attn_out_spec = gdn_recoverssm_verify(
+                q=query_spec,
+                k=key_spec,
+                v=value_spec,
+                a=a_spec,
+                b=b_spec,
+                A_log=self.A_log,
+                dt_bias=self.dt_bias,
+                checkpoint_state=ssm_state,
+                correction_cache=self_kv_cache[2],
+                key_cache=self_kv_cache[3],
+                decay_cache=self_kv_cache[4],
+                query_start_loc=spec_query_start_loc[: num_spec_decodes + 1],
+                state_indices=spec_state_indices_tensor[:num_spec_decodes, 0],
+                spec_query_len=self.num_spec + 1,
+            )
+        elif spec_sequence_masks is not None:
             core_attn_out_spec, last_recurrent_state = (
                 fused_sigmoid_gating_delta_rule_update(
                     A_log=self.A_log,
@@ -2862,7 +2906,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
     ) -> bool:
         state_indices = attn_metadata.spec_state_indices_tensor
         return (
-            self.beta_scale == 1.0
+            not self.use_recoverssm
+            and self.beta_scale == 1.0
             and attn_metadata.spec_sequence_masks is not None
             and attn_metadata.num_decodes == 0
             and attn_metadata.num_spec_decodes > 0

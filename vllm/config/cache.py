@@ -324,19 +324,21 @@ class CacheConfig:
     """ReplaySSM logical history length B. Mamba2 Triton standard decode and
     Gated DeltaNet (Qwen3.5, Qwen4Exp) use B physical rows, at most 32 for Gated
     DeltaNet; FlashInfer and Triton speculative decoding use B+T, where T is
-    the target verification length. Kimi-K3 speculative decode does not use B.
-    Default 16."""
+    the target verification length. Kimi-K3 and Gated DeltaNet speculative decode
+    (RecoverSSM) do not use B. Default 16."""
     use_replayssm: bool = False
     """Use the ReplaySSM decode kernels for Mamba2 and Gated DeltaNet (Qwen3.5,
     Qwen4Exp): cache recent SSM inputs and skip the per-step full-state store,
     writing the checkpoint back only on flush. Triton and FlashInfer support
     Mamba prefix caching on and off. Mamba2 speculative decoding supports both
-    backends; Gated DeltaNet supports Triton standard decode only. Pipeline
-    parallelism is not supported. Flushes are most efficient when
-    mamba_block_size is a multiple of replayssm_buffer_len, but this is not
-    required."""
+    backends. Gated DeltaNet uses Triton ReplaySSM without speculative decoding
+    and RecoverSSM with it (Qwen3-Next and Qwen3.5). Pipeline parallelism is
+    not supported. Flushes are most efficient when mamba_block_size is a
+    multiple of replayssm_buffer_len, but this is not required."""
     use_kda_recoverssm: bool = field(default=False, init=False)
     """Whether Kimi-K3 KDA uses RecoverSSM speculative decode."""
+    use_gdn_recoverssm: bool = field(default=False, init=False)
+    """Whether Qwen GatedDeltaNet uses RecoverSSM speculative decode."""
 
     # Will be set after profiling.
     num_gpu_blocks: int | None = field(default=None, init=False)

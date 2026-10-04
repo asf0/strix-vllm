@@ -650,12 +650,16 @@ class Qwen3_5ForCausalLMBase(
         cls,
         vllm_config: "VllmConfig",
     ) -> tuple[torch.dtype, ...]:
-        return MambaStateDtypeCalculator.gated_delta_net_state_dtype(
+        dtypes = MambaStateDtypeCalculator.gated_delta_net_state_dtype(
             vllm_config.model_config.dtype,
             vllm_config.cache_config.mamba_cache_dtype,
             vllm_config.cache_config.mamba_ssm_cache_dtype,
-            vllm_config.cache_config.use_replayssm,
+            vllm_config.cache_config.use_replayssm
+            and not vllm_config.cache_config.use_gdn_recoverssm,
         )
+        if vllm_config.cache_config.use_gdn_recoverssm:
+            return MambaStateDtypeCalculator.append_gdn_recoverssm_records(dtypes)
+        return dtypes
 
     @classmethod
     def get_mamba_state_shape_from_config(
@@ -670,7 +674,7 @@ class Qwen3_5ForCausalLMBase(
             else 0
         )
         cache_config = vllm_config.cache_config
-        return MambaStateShapeCalculator.gated_delta_net_state_shape(
+        shapes = MambaStateShapeCalculator.gated_delta_net_state_shape(
             tp_size,
             hf_config.linear_num_key_heads,
             hf_config.linear_num_value_heads,
@@ -678,8 +682,21 @@ class Qwen3_5ForCausalLMBase(
             hf_config.linear_value_head_dim,
             hf_config.linear_conv_kernel_dim,
             num_spec,
-            cache_config.replayssm_buffer_len if cache_config.use_replayssm else None,
+            cache_config.replayssm_buffer_len
+            if cache_config.use_replayssm and not cache_config.use_gdn_recoverssm
+            else None,
         )
+        if vllm_config.cache_config.use_gdn_recoverssm:
+            return MambaStateShapeCalculator.append_gdn_recoverssm_records(
+                shapes,
+                tp_size,
+                hf_config.linear_num_key_heads,
+                hf_config.linear_num_value_heads,
+                hf_config.linear_key_head_dim,
+                hf_config.linear_value_head_dim,
+                spec_query_len=1 + num_spec,
+            )
+        return shapes
 
     @classmethod
     def get_mamba_state_copy_func(
@@ -859,12 +876,16 @@ class Qwen3_5ForConditionalGeneration(
         cls,
         vllm_config: "VllmConfig",
     ) -> tuple[torch.dtype, ...]:
-        return MambaStateDtypeCalculator.gated_delta_net_state_dtype(
+        dtypes = MambaStateDtypeCalculator.gated_delta_net_state_dtype(
             vllm_config.model_config.dtype,
             vllm_config.cache_config.mamba_cache_dtype,
             vllm_config.cache_config.mamba_ssm_cache_dtype,
-            vllm_config.cache_config.use_replayssm,
+            vllm_config.cache_config.use_replayssm
+            and not vllm_config.cache_config.use_gdn_recoverssm,
         )
+        if vllm_config.cache_config.use_gdn_recoverssm:
+            return MambaStateDtypeCalculator.append_gdn_recoverssm_records(dtypes)
+        return dtypes
 
     @classmethod
     def get_mamba_state_shape_from_config(
@@ -879,7 +900,7 @@ class Qwen3_5ForConditionalGeneration(
             else 0
         )
         cache_config = vllm_config.cache_config
-        return MambaStateShapeCalculator.gated_delta_net_state_shape(
+        shapes = MambaStateShapeCalculator.gated_delta_net_state_shape(
             tp_size,
             hf_config.linear_num_key_heads,
             hf_config.linear_num_value_heads,
@@ -887,8 +908,21 @@ class Qwen3_5ForConditionalGeneration(
             hf_config.linear_value_head_dim,
             hf_config.linear_conv_kernel_dim,
             num_spec,
-            cache_config.replayssm_buffer_len if cache_config.use_replayssm else None,
+            cache_config.replayssm_buffer_len
+            if cache_config.use_replayssm and not cache_config.use_gdn_recoverssm
+            else None,
         )
+        if vllm_config.cache_config.use_gdn_recoverssm:
+            return MambaStateShapeCalculator.append_gdn_recoverssm_records(
+                shapes,
+                tp_size,
+                hf_config.linear_num_key_heads,
+                hf_config.linear_num_value_heads,
+                hf_config.linear_key_head_dim,
+                hf_config.linear_value_head_dim,
+                spec_query_len=1 + num_spec,
+            )
+        return shapes
 
     @classmethod
     def get_mamba_state_copy_func(cls) -> tuple[MambaStateCopyFunc, MambaStateCopyFunc]:
