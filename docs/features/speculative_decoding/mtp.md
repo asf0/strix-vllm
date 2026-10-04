@@ -67,6 +67,26 @@ vllm serve XiaomiMiMo/MiMo-7B-Base \
     --speculative-config '{"method":"mtp","num_speculative_tokens":1}'
 ```
 
+## Hybrid GatedDeltaNet Models
+
+Qwen3.5 and Qwen3-Next mix full attention with GatedDeltaNet (linear
+attention) layers. By default, MTP keeps one recurrent state per draft token
+for every GatedDeltaNet layer, so each request holds `1 + num_speculative_tokens`
+full states per layer and the KV cache fills much faster than without MTP.
+Add `--use-replayssm` to keep a single state per request instead
+(RecoverSSM):
+
+```bash
+vllm serve Qwen/Qwen3-Next-80B-A3B-Instruct \
+    --speculative-config '{"method":"mtp","num_speculative_tokens":2}' \
+    --use-replayssm
+```
+
+Verification runs off that state without writing it, and the accepted
+tokens are replayed onto it after sampling, reproducing the same states. See
+[GatedDeltaNet RecoverSSM](../../design/gdn_recoverssm.md) for how it works,
+its requirements, and measurements.
+
 ## Notes
 
 - MTP only works for model families that support MTP in vLLM.

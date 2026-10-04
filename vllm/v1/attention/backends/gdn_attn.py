@@ -4,7 +4,7 @@
 
 import math
 from dataclasses import dataclass, replace
-from typing import Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 import torch
 
@@ -21,6 +21,10 @@ from vllm.v1.attention.backend import (
     AttentionMetadataBuilder,
     CommonAttentionMetadata,
 )
+from vllm.v1.attention.backends.recoverssm_metadata import (
+    RecoverSSMMetadata,
+    RecoverSSMPostprocessMetadata,
+)
 from vllm.v1.attention.backends.utils import (
     NULL_BLOCK_ID,
     compute_causal_conv1d_metadata,
@@ -28,6 +32,12 @@ from vllm.v1.attention.backends.utils import (
     split_decodes_and_prefills,
 )
 from vllm.v1.kv_cache_interface import MambaSpec
+
+if TYPE_CHECKING:
+    from vllm.model_executor.layers.mamba.ops.gdn_recoverssm import (
+        GDNRecoverSSMCommitContext,
+    )
+
 
 # FlashInfer's GDN prefill emits states every N tokens, N a multiple of its
 # 64-token chunk, so checkpoint offsets must be multiples of 64.
@@ -131,6 +141,53 @@ class GDNAttentionMetadata:
     token_chunk_offset_ptr: torch.Tensor | None = None
 
 
+@dataclass
+class GDNRecoverSSMCommit:
+    """What the post-sampling commit needs from one speculative step."""
+
+    context: "GDNRecoverSSMCommitContext"
+    state_indices: torch.Tensor
+    query_start_loc: torch.Tensor
+    # Batch row of each speculative request; None when they lead the batch.
+    request_indices: torch.Tensor | None
+    # Align mode only: the group's block table and pre-step computed tokens.
+    block_table: torch.Tensor | None = None
+    num_computed_tokens: torch.Tensor | None = None
+    block_size: int | None = None
+
+
+@dataclass
+class GDNRecoverSSMAttentionMetadata(GDNAttentionMetadata, RecoverSSMMetadata):
+    recoverssm_commit: GDNRecoverSSMCommit | None = None
+
+    def commit_recoverssm_state(
+        self, num_accepted_tokens: torch.Tensor
+    ) -> RecoverSSMPostprocessMetadata | None:
+        commit = self.recoverssm_commit
+        if commit is None:
+            return None
+        commit.context.commit(
+            num_accepted_tokens,
+            commit.state_indices[: self.num_spec_decodes, 0],
+            commit.query_start_loc[: self.num_spec_decodes + 1],
+            request_indices=commit.request_indices,
+            block_table=commit.block_table,
+            num_computed_tokens=commit.num_computed_tokens,
+            mamba_block_size=commit.block_size,
+        )
+        if commit.block_table is None:
+            return None
+        assert commit.num_computed_tokens is not None
+        assert commit.block_size is not None
+        return RecoverSSMPostprocessMetadata(
+            num_spec_decodes=self.num_spec_decodes,
+            request_indices=commit.request_indices,
+            block_table=commit.block_table,
+            num_computed_tokens=commit.num_computed_tokens,
+            block_size=commit.block_size,
+        )
+
+
 class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]):
     kv_cache_spec: MambaSpec
     _cudagraph_support = AttentionCGSupport.UNIFORM_BATCH
@@ -179,6 +236,18 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         self.use_full_cuda_graph: bool = (
             self.compilation_config.cudagraph_mode.has_full_cudagraphs()
         )
+        # RecoverSSM verifies off the checkpoint block alone and commits after
+        # sampling, so speculative rows need one state slot and no conv shift.
+        self.use_recoverssm: bool = vllm_config.cache_config.use_gdn_recoverssm
+        self.spec_state_slots: int = 1 if self.use_recoverssm else self.num_spec + 1
+        self._recoverssm_context: GDNRecoverSSMCommitContext | None = None
+        self._recoverssm_ones: torch.Tensor | None = None
+        if self.use_recoverssm:
+            self._recoverssm_ones = torch.ones(
+                vllm_config.scheduler_config.max_num_seqs,
+                dtype=torch.int32,
+                device=device,
+            )
         # update_block_table() keeps the source group's batch-level FULL graph
         # buffers, so only MRV2, which also reuses metadata at capture, may use
         # it.
@@ -187,6 +256,8 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             and device.type == "cuda"
             # Not isinstance: KDA's RecoverSSM/checkpoint metadata is per group.
             and type(self) is GDNAttentionMetadataBuilder
+            # GDN RecoverSSM's commit context is built from this group's layers.
+            and not self.use_recoverssm
         )
         if self.supports_update_block_table:
             # Opts into MRV2's CUDA-only aligned-index precompute.
@@ -202,7 +273,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             )
 
         self.spec_state_indices_tensor: torch.Tensor = torch.empty(
-            (self.decode_cudagraph_max_bs, self.num_spec + 1),
+            (self.decode_cudagraph_max_bs, self.spec_state_slots),
             dtype=torch.int32,
             device=device,
         )
@@ -336,11 +407,18 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
 
         uniform_spec_sequence_length = None
         spec_sequence_masks_cpu: torch.Tensor | None = None
+        spec_request_indices: torch.Tensor | None = None
         if not self.use_spec_decode or num_decode_draft_tokens_cpu is None:
             spec_sequence_masks = None
             num_spec_decodes = 0
         else:
             spec_sequence_masks_cpu = num_decode_draft_tokens_cpu >= 0
+            if self.use_recoverssm:
+                # Capture dummies can be wider than the verify window; those
+                # rows take the prefill path instead.
+                spec_sequence_masks_cpu &= (
+                    query_start_loc_cpu.diff() <= self.num_spec + 1
+                )
             num_spec_decodes = spec_sequence_masks_cpu.sum().item()
             # A batch whose rows all drafted nothing still has to run the
             # speculative path: that is the only path that applies each row's
@@ -445,7 +523,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 # Padded sequences trail the spec decodes, so slice them off
                 # rather than gather with the host mask (an H2D copy + a kernel).
                 spec_state_indices_tensor = block_table_tensor[
-                    :num_spec_decodes, : self.num_spec + 1
+                    :num_spec_decodes, : self.spec_state_slots
                 ]
                 non_spec_state_indices_tensor = None
                 # Padded sequences are always at the back, so the first
@@ -461,12 +539,18 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                     output_size=query_start_loc_cpu[-1].item(),
                 )
                 index = torch.argsort(spec_token_masks, stable=True)
+                if self.use_recoverssm:
+                    spec_request_indices = async_tensor_h2d(
+                        spec_sequence_masks_cpu.nonzero(as_tuple=True)[0],
+                        dtype=torch.int32,
+                        device=query_start_loc.device,
+                    )
                 num_non_spec_tokens = num_prefill_tokens + num_decode_tokens
                 non_spec_token_indx = index[:num_non_spec_tokens]
                 spec_token_indx = index[num_non_spec_tokens:]
 
                 spec_state_indices_tensor = block_table_tensor[
-                    spec_sequence_masks_cpu, : self.num_spec + 1
+                    spec_sequence_masks_cpu, : self.spec_state_slots
                 ]
                 non_spec_state_indices_tensor = block_table_tensor[
                     non_spec_sequence_masks_cpu, 0
@@ -507,6 +591,9 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 num_accepted_tokens = num_accepted_tokens[:num_spec_decodes]
             else:
                 num_accepted_tokens = num_accepted_tokens[spec_sequence_masks_cpu]
+            if self._recoverssm_ones is not None:
+                # The commit already compacted each conv window to its start.
+                num_accepted_tokens = self._recoverssm_ones[:num_spec_decodes]
 
         chunk_indices: torch.Tensor | None = None
         chunk_offsets: torch.Tensor | None = None
@@ -670,7 +757,18 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             non_spec_query_start_loc = self.non_spec_query_start_loc[: batch_size + 1]
             non_spec_query_start_loc[num_decodes + 1 :].fill_(non_spec_num_query_tokens)
 
-        attn_metadata = GDNAttentionMetadata(
+        metadata_cls: type[GDNAttentionMetadata] = GDNAttentionMetadata
+        metadata_kwargs: dict[str, Any] = {}
+        if self.use_recoverssm:
+            metadata_cls = GDNRecoverSSMAttentionMetadata
+            if num_spec_decodes > 0:
+                metadata_kwargs["recoverssm_commit"] = self._build_recoverssm_commit(
+                    m,
+                    spec_state_indices_tensor,
+                    spec_query_start_loc,
+                    spec_request_indices,
+                )
+        attn_metadata = metadata_cls(
             num_prefills=num_prefills,
             num_prefill_tokens=num_prefill_tokens,
             num_decodes=num_decodes,
@@ -700,6 +798,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             nums_dict=nums_dict,
             batch_ptr=batch_ptr,
             token_chunk_offset_ptr=token_chunk_offset_ptr,
+            **metadata_kwargs,
         )
         return attn_metadata
 
@@ -787,6 +886,39 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             prefill_state_indices=prefill_indices,
             checkpoint=checkpoint,
         )
+
+    def _build_recoverssm_commit(
+        self,
+        m: CommonAttentionMetadata,
+        state_indices: torch.Tensor | None,
+        query_start_loc: torch.Tensor | None,
+        request_indices: torch.Tensor | None,
+    ) -> GDNRecoverSSMCommit:
+        assert state_indices is not None and query_start_loc is not None
+        context = self._recoverssm_context
+        if context is None:
+            from vllm.model_executor.layers.mamba.ops.gdn_recoverssm import (
+                GDNRecoverSSMCommitContext,
+            )
+
+            forward_context = self.vllm_config.compilation_config.static_forward_context
+            context = GDNRecoverSSMCommitContext.create(
+                [forward_context[name] for name in self.layer_names],
+                spec_query_len=self.num_spec + 1,
+                max_num_reqs=self.vllm_config.scheduler_config.max_num_seqs,
+            )
+            self._recoverssm_context = context
+        commit = GDNRecoverSSMCommit(
+            context=context,
+            state_indices=state_indices,
+            query_start_loc=query_start_loc,
+            request_indices=request_indices,
+        )
+        if self.kv_cache_spec.mamba_cache_mode == "align":
+            commit.block_table = m.block_table_tensor
+            commit.num_computed_tokens = m.compute_num_computed_tokens()
+            commit.block_size = self.kv_cache_spec.block_size
+        return commit
 
     def build_for_cudagraph_capture(
         self, common_attn_metadata: CommonAttentionMetadata

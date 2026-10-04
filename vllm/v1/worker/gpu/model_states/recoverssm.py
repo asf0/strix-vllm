@@ -91,6 +91,7 @@ def _postprocess_recoverssm_align_kernel(
         return
     num_sampled = tl.load(num_sampled_ptr + batch_idx)
     num_computed = tl.load(num_computed_ptr + batch_idx)
+    # Same column the commit wrote: the block holding the last computed token.
     tl.store(
         state_idx_ptr + req_state_idx,
         tl.minimum(

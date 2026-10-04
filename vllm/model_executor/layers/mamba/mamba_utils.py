@@ -148,6 +148,12 @@ class MambaStateDtypeCalculator:
             )
         return (conv_state_dtype, recurrent_state_dtype)
 
+    @classmethod
+    def append_gdn_recoverssm_records(
+        cls, base_dtypes: tuple[torch.dtype, ...]
+    ) -> tuple[torch.dtype, ...]:
+        return (*base_dtypes, torch.float32, torch.float32, torch.float32)
+
 
 class MambaStateShapeCalculator:
     @classmethod
@@ -317,6 +323,27 @@ class MambaStateShapeCalculator:
         )
         recurrent_state_shape = (divide(num_heads, tp_world_size), head_dim, head_dim)
         return (conv_state_shape, recurrent_state_shape)
+
+    @classmethod
+    def append_gdn_recoverssm_records(
+        cls,
+        base_shapes: tuple[tuple[int, ...], ...],
+        tp_world_size: int,
+        num_k_heads: int,
+        num_v_heads: int,
+        head_k_dim: int,
+        head_v_dim: int,
+        spec_query_len: int,
+    ) -> tuple[tuple[int, ...], ...]:
+        """Append the per-token correction, normalized-key and decay records."""
+        local_k_heads = divide(num_k_heads, tp_world_size)
+        local_v_heads = divide(num_v_heads, tp_world_size)
+        return (
+            *base_shapes,
+            (local_v_heads, spec_query_len, head_v_dim),
+            (local_k_heads, spec_query_len, head_k_dim),
+            (local_v_heads, spec_query_len),
+        )
 
 
 @dataclass
