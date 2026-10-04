@@ -75,6 +75,11 @@ _GFX1151_DECODE_WARPS = {
     (KVQuantMode.FP8_PER_TOKEN_HEAD, 256): (2, 4),
 }
 
+# gfx1151 INT8 verification batches of at least this many sequences use
+# 32-key tiles with 4 warps: half the per-tile overhead of 16-key tiles, +7-9%
+# at 8-40 seqs x 16K context (slower for a single sequence).
+_GFX1151_WIDE_VERIFY_MIN_SEQS = 8
+
 # gfx1151 split-KV num_warps for head_size 256 multi-token queries
 # (speculative-decoding verification), for 32- and 64-row q-blocks. Fewer warps
 # spill the larger accumulator. Measured over 32 seqs, 16K context.
@@ -1376,6 +1381,20 @@ def unified_attention(
     segm_expsum_ptr = softmax_segm_expsum if use_3d else None
     num_segments = num_par_softmax_segments if use_3d else 1
 
+    gfx1151_wide_verify = (
+        use_3d
+        and _ON_GFX1151
+        and max_seqlen_q > 1
+        and head_size == 256
+        and kv_quant_mode == KVQuantMode.INT8_PER_TOKEN_HEAD
+        and num_seqs >= _GFX1151_WIDE_VERIFY_MIN_SEQS
+        and block_size % 32 == 0
+        and q.dtype in (torch.bfloat16, torch.float16)
+    )
+    if gfx1151_wide_verify:
+        # Also read by reduce_segments, which must see the same tiling.
+        TILE_SIZE_DECODE = 32
+
     grid: tuple[Any, ...]
     if not use_3d:
         grid = (total_num_q_blocks, num_kv_heads)
@@ -1414,6 +1433,8 @@ def unified_attention(
         if head_size == 256 and BLOCK_M > 16:
             verify_warps = _GFX1151_VERIFY_WARPS[kv_quant_mode]
             launch_num_warps = verify_warps[BLOCK_M > 32]
+        if gfx1151_wide_verify:
+            launch_num_warps = 4
 
     launch_kwargs: dict[str, int] = {}
     if launch_num_warps is not None:
