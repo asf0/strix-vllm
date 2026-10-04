@@ -204,6 +204,7 @@ def test_kda_recoverssm_startup_metadata_flow_without_model(monkeypatch):
         cache_config=SimpleNamespace(
             mamba_cache_mode="align",
             use_kda_recoverssm=True,
+            use_gdn_recoverssm=False,
             prefix_match_unit=None,
         ),
         parallel_config=SimpleNamespace(decode_context_parallel_size=1),

@@ -120,6 +120,7 @@ def _build_layer(
         norm=_TestGatedNorm(norm_weight, output_gate_activation),
         layer_norm_epsilon=EPS,
         gdn_decode_kernel="cuda",
+        use_recoverssm=False,
     )
     with set_current_vllm_config(vllm_config):
         layer.chunk_gated_delta_rule = ChunkGatedDeltaRule()
@@ -163,6 +164,7 @@ def test_fused_mtp_head_ratio_guard(num_v_heads: int, expected: bool) -> None:
         num_v_heads=num_v_heads,
         kv_cache=(None, torch.empty(1, dtype=torch.float32, device="cuda")),
         gdn_decode_kernel="cuda",
+        use_recoverssm=False,
     )
     attn_metadata = types.SimpleNamespace(
         spec_state_indices_tensor=torch.ones(

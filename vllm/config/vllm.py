@@ -71,6 +71,15 @@ else:
 
 logger = init_logger(__name__)
 
+# Models whose GatedDeltaNet layers support RecoverSSM speculative decode.
+_GDN_RECOVERSSM_ARCHITECTURES = (
+    "Qwen3NextForCausalLM",
+    "Qwen3_5ForCausalLM",
+    "Qwen3_5MoeForCausalLM",
+    "Qwen3_5ForConditionalGeneration",
+    "Qwen3_5MoeForConditionalGeneration",
+)
+
 DEFAULT_BREAKABLE_CUDAGRAPH_ARCHITECTURES = frozenset(
     {
         "DeepseekV32MTPModel",
@@ -3357,7 +3366,17 @@ class VllmConfig:
     def validate_mamba_cached_kernel(self) -> "VllmConfig":
         if not self.cache_config.use_replayssm:
             self.cache_config.use_kda_recoverssm = False
+            self.cache_config.use_gdn_recoverssm = False
             return self
+        if (
+            self.model_config is not None
+            and self.model_config.architecture in _GDN_RECOVERSSM_ARCHITECTURES
+        ):
+            self.cache_config.use_kda_recoverssm = False
+            self.cache_config.use_gdn_recoverssm = True
+            self._validate_gdn_recoverssm()
+            return self
+        self.cache_config.use_gdn_recoverssm = False
 
         kda_architectures = (
             "KimiLinearForCausalLM",
@@ -3449,6 +3468,40 @@ class VllmConfig:
                 "(P/D disaggregation, KV cache offload)"
             )
         return self
+
+    def _validate_gdn_recoverssm(self) -> None:
+        from vllm.platforms import current_platform
+
+        if self.num_speculative_tokens == 0:
+            raise ValueError(
+                "Qwen GatedDeltaNet supports --use-replayssm only with "
+                "speculative decoding (RecoverSSM)"
+            )
+        if not current_platform.is_cuda_alike():
+            raise ValueError("GDN RecoverSSM requires a CUDA or ROCm GPU")
+        if self.mamba_config.enable_stochastic_rounding:
+            raise ValueError(
+                "GDN RecoverSSM does not support "
+                "--enable-mamba-cache-stochastic-rounding"
+            )
+        if self.cache_config.mamba_cache_mode not in ("none", "align"):
+            raise ValueError(
+                "GDN RecoverSSM supports only none and align Mamba cache modes"
+            )
+        if not self.use_v2_model_runner:
+            raise ValueError("GDN RecoverSSM requires VLLM_USE_V2_MODEL_RUNNER=1")
+        if self.parallel_config.pipeline_parallel_size > 1:
+            raise ValueError(
+                "GDN RecoverSSM currently requires pipeline_parallel_size=1"
+            )
+        if (
+            self.kv_transfer_config is not None
+            and self.kv_transfer_config.is_kv_transfer_instance
+        ):
+            raise ValueError(
+                "--use-replayssm is incompatible with KV connectors "
+                "(P/D disaggregation, KV cache offload)"
+            )
 
 
 _current_vllm_config: VllmConfig | None = None
