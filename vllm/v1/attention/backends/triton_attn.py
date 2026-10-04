@@ -146,6 +146,17 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
                 key=lambda x: abs(x - self.seq_threshold_3D),
             )
 
+        # gfx1151: past the threshold, verify batches fall to the 2D prefill
+        # launch (BLOCK_M 128 for (1+k) x GQA rows), which is compute-bound
+        # and ~2x slower per layer. Keep every schedulable batch on split-KV.
+        if current_platform.is_rocm():
+            from vllm.platforms.rocm import on_gfx1151
+
+            if on_gfx1151():
+                self.seq_threshold_3D = max(
+                    self.seq_threshold_3D, vllm_config.scheduler_config.max_num_seqs
+                )
+
         self.num_par_softmax_segments = NUM_PAR_SOFTMAX_SEGMENTS
         # On SM120, batches whose 16-segment decode grid under-fills the SMs use
         # 64. This counts requests, not Q blocks, on purpose: for 1..11 verify
