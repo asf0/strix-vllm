@@ -145,6 +145,12 @@ device_torch_lib = getattr(torch, device, None)
 device_platform = _check_platform()
 
 is_amd = device_platform == "amd"
+if current_platform.is_rocm():
+    from vllm.platforms.rocm import on_gfx1151
+
+    is_gfx1151 = on_gfx1151()
+else:
+    is_gfx1151 = False
 is_intel = device_platform == "intel"
 is_nvidia = device_platform == "nvidia"
 is_intel_alchemist = is_intel and "Intel(R) Arc(TM) A" in torch.xpu.get_device_name(0)

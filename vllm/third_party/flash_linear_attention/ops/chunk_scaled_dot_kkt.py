@@ -61,7 +61,7 @@ def chunk_scaled_dot_kkt_fwd_kernel(
     USE_G: tl.constexpr,
     CAST_DOT_TO_K_DTYPE: tl.constexpr,
 ):
-    i_t, i_bh = tl.program_id(0).to(tl.int64), tl.program_id(1).to(tl.int64)
+    i_bh, i_t = tl.program_id(0).to(tl.int64), tl.program_id(1).to(tl.int64)
     i_b, i_h = i_bh // H, i_bh % H
     if IS_VARLEN:
         i_n, i_t = (
@@ -154,7 +154,7 @@ def chunk_scaled_dot_kkt_fwd(
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
 
     A = torch.empty(B, T, H, BT, device=k.device, dtype=output_dtype)
-    chunk_scaled_dot_kkt_fwd_kernel[(NT, B * H)](
+    chunk_scaled_dot_kkt_fwd_kernel[(B * H, NT)](
         k=k,
         g=g,
         beta=beta,

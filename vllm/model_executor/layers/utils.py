@@ -285,6 +285,27 @@ def wvsplitkrc_dispatch(n: int, k: int, m: int, cu_count: int) -> tuple[int, boo
     return chunkk, fits
 
 
+# gfx1151: hipBLASLt drops from ~41 to ~30 TFLOPS on long-K GEMMs (e.g. MLP
+# down, K=17408) once M grows past ~1K rows; 1K-row slices keep the activation
+# panel near the 32 MB infinity cache.
+_GFX1151_GEMM_CHUNK_MIN_K = 16384
+_GFX1151_GEMM_CHUNK_ROWS = 1024
+
+
+def _gfx1151_row_chunked_gemm(
+    x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None
+) -> torch.Tensor:
+    x2 = x.reshape(-1, x.size(-1))
+    out = x2.new_empty(x2.size(0), weight.size(0))
+    for start in range(0, x2.size(0), _GFX1151_GEMM_CHUNK_ROWS):
+        end = start + _GFX1151_GEMM_CHUNK_ROWS
+        if bias is None:
+            torch.matmul(x2[start:end], weight.t(), out=out[start:end])
+        else:
+            torch.addmm(bias, x2[start:end], weight.t(), out=out[start:end])
+    return out.reshape(*x.shape[:-1], weight.size(0))
+
+
 def rocm_unquantized_gemm_impl(
     x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None
 ) -> torch.Tensor:
@@ -295,7 +316,13 @@ def rocm_unquantized_gemm_impl(
 
         return linear_batch_invariant(x, weight, bias)
 
-    from vllm.platforms.rocm import on_gfx1x, on_gfx9, on_gfx950, on_gfx1250
+    from vllm.platforms.rocm import (
+        on_gfx1x,
+        on_gfx9,
+        on_gfx950,
+        on_gfx1151,
+        on_gfx1250,
+    )
 
     n = x.numel() // x.size(-1)
     m = weight.shape[0]
@@ -365,6 +392,14 @@ def rocm_unquantized_gemm_impl(
         from aiter.tuned_gemm import tgemm
 
         return tgemm.mm(x, weight, bias)
+
+    if (
+        on_gfx1151()
+        and k >= _GFX1151_GEMM_CHUNK_MIN_K
+        and n > _GFX1151_GEMM_CHUNK_ROWS
+        and weight.dtype == x.dtype
+    ):
+        return _gfx1151_row_chunked_gemm(x, weight, bias)
 
     return torch.nn.functional.linear(x, weight, bias)
 

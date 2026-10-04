@@ -68,12 +68,17 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
     # one program handles one chunk in a single sequence
     # rather than mixing sequences - to make updating initial_states across sequences efficiently
 
+    # Feature blocks vary fastest so concurrent programs read whole token rows.
+    num_feat_blocks: tl.constexpr = (dim + BLOCK_N - 1) // BLOCK_N
+    pid_m = tl.program_id(0) // num_feat_blocks
+    pid_n = tl.program_id(0) % num_feat_blocks
+
     # single-sequence id
-    idx_seq = tl.load(batch_ptr + tl.program_id(0)).to(tl.int64)
-    chunk_offset = tl.load(token_chunk_offset_ptr + tl.program_id(0))
+    idx_seq = tl.load(batch_ptr + pid_m).to(tl.int64)
+    chunk_offset = tl.load(token_chunk_offset_ptr + pid_m)
 
     # BLOCK_N elements along the feature-dimension (channel)
-    idx_feats = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
+    idx_feats = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
 
     if idx_seq == pad_slot_id:
         if launch_pdl:
@@ -581,10 +586,7 @@ def causal_conv1d_fn(
             return tot
 
     def grid(META):
-        return (
-            num_program(META, args),
-            triton.cdiv(dim, META["BLOCK_N"]),
-        )
+        return (num_program(META, args) * triton.cdiv(dim, META["BLOCK_N"]),)
 
     if batch_ptr.device != x.device:
         batch_ptr = batch_ptr.to(x.device)
