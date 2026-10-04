@@ -6,6 +6,7 @@ Covers the fix for https://github.com/vllm-project/vllm/issues/34845.
 """
 
 from dataclasses import dataclass
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -21,6 +22,7 @@ from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.attention.backends.gdn_attn import (
     GDNAttentionMetadata,
     GDNAttentionMetadataBuilder,
+    GDNRecoverSSMAttentionMetadata,
     plan_flashinfer_checkpoints,
 )
 from vllm.v1.attention.backends.utils import mamba_get_block_table_tensor
@@ -150,12 +152,14 @@ GDN_BUILD_TEST_CASES = {
 def _create_gdn_builder(
     num_speculative_tokens: int = 0,
     full_cuda_graph: bool = False,
+    use_recoverssm: bool = False,
 ) -> GDNAttentionMetadataBuilder:
     """Create a GDNAttentionMetadataBuilder with minimal config."""
     vllm_config = create_vllm_config(
         model_name="Qwen/Qwen3.5-0.8B",
         block_size=BLOCK_SIZE,
     )
+    vllm_config.cache_config.use_gdn_recoverssm = use_recoverssm
     vllm_config.compilation_config.cudagraph_mode = (
         CUDAGraphMode.FULL_AND_PIECEWISE if full_cuda_graph else CUDAGraphMode.NONE
     )
@@ -506,3 +510,49 @@ def test_plan_flashinfer_checkpoints_selects_the_state_at_each_offset():
     # Row 1: state after 128 tokens of the first prefill. Row 3: after 192
     # tokens of the third prefill, whose states start at index 3.
     assert rows == [0, 1, 0, 5]
+
+
+def test_recoverssm_spec_rows_use_checkpoint_slot_and_commit_metadata():
+    """RecoverSSM reads one state slot, leaves the conv window unshifted, and
+    hands the commit the batch rows of its speculative requests."""
+    builder = _create_gdn_builder(
+        num_speculative_tokens=2, full_cuda_graph=True, use_recoverssm=True
+    )
+    builder._recoverssm_context = Mock()
+    batch = BatchSpec(seq_lens=[100, 65, 20], query_lens=[50, 3, 2])
+    meta = _build(builder, batch, num_decode_draft_tokens=[-1, 2, 1])
+
+    assert isinstance(meta, GDNRecoverSSMAttentionMetadata)
+    assert meta.num_spec_decodes == 2
+    assert meta.spec_state_indices_tensor is not None
+    assert meta.spec_state_indices_tensor.shape == (2, 1)
+    assert meta.num_accepted_tokens is not None
+    assert meta.num_accepted_tokens.tolist() == [1, 1]
+    commit = meta.recoverssm_commit
+    assert commit is not None
+    assert commit.request_indices is not None
+    assert commit.request_indices.tolist() == [1, 2]
+    assert commit.block_table is None
+
+    num_sampled = torch.tensor([0, 2, 1], dtype=torch.int32)
+    assert meta.commit_recoverssm_state(num_sampled) is None
+    (accepted, state_indices, query_start_loc), kwargs = (
+        builder._recoverssm_context.commit.call_args
+    )
+    assert accepted is num_sampled
+    torch.testing.assert_close(state_indices, meta.spec_state_indices_tensor[:, 0])
+    assert query_start_loc.tolist() == [0, 3, 5]
+    assert kwargs["request_indices"] is commit.request_indices
+
+
+def test_recoverssm_routes_rows_wider_than_window_to_prefill():
+    """Capture dummies can exceed 1 + k tokens per row; they must not reach the
+    fixed-width verify kernel."""
+    builder = _create_gdn_builder(num_speculative_tokens=2, use_recoverssm=True)
+    batch = BatchSpec(seq_lens=[40], query_lens=[8])
+    meta = _build(builder, batch, num_decode_draft_tokens=[7])
+
+    assert meta.num_spec_decodes == 0
+    assert meta.num_prefills == 1
+    assert isinstance(meta, GDNRecoverSSMAttentionMetadata)
+    assert meta.recoverssm_commit is None
