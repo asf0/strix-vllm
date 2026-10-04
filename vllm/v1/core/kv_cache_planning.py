@@ -178,7 +178,9 @@ def check_enough_kv_cache_memory(
         # of the specs since grouping may unify them in-place.
         groups = get_kv_cache_groups(vllm_config, dict(kv_cache_spec))
         check_memory = (
-            available_memory - _null_block_bytes(groups) if groups else available_memory
+            available_memory - _null_block_bytes(vllm_config, groups)
+            if groups
+            else available_memory
         )
         _check_enough_kv_cache_memory(
             check_memory,
@@ -284,10 +286,10 @@ def _pool_bytes_per_block_from_builder(
         return 0
     if vllm_config.attention_config.hisparse_config is not None:
         return _pool_bytes_per_block(vllm_config, kv_cache_groups)
-    if _uses_heterogeneous_pools(kv_cache_groups):
-        # The placement splits into one pool per distinct block width, so one
-        # block ID spans several device backings: their widths add up.
-        return _null_block_bytes(kv_cache_groups)
+    if _uses_multiple_pools(vllm_config, kv_cache_groups):
+        # One block ID spans one block of every fixed-width pool: their widths
+        # add up, where the legacy shared pool takes the widest width.
+        return _null_block_bytes(vllm_config, kv_cache_groups)
     pool_bytes = builder._get_pool_bytes_per_block(vllm_config, kv_cache_groups)
     if pool_bytes is not None:
         return pool_bytes
@@ -312,21 +314,16 @@ def _pool_bytes_per_block_from_builder(
     return backing_sizes.pop()
 
 
-def _uses_heterogeneous_pools(kv_cache_groups: list[KVCacheGroupSpec]) -> bool:
-    """Whether the placement needs one physical pool per distinct block width.
-
-    Mirrors the condition the config builder uses to split pools: at least one
-    group carries a padded physical width, and the raw page sums differ.
-    """
-    widths = {_get_group_bytes_per_block(group) for group in kv_cache_groups}
-    return (
-        any(group.physical_bytes_per_block is not None for group in kv_cache_groups)
-        and len({width for width in widths if width > 0}) > 1
+def _null_block_bytes(
+    vllm_config: VllmConfig, kv_cache_groups: list[KVCacheGroupSpec]
+) -> int:
+    """Bytes the BlockPools hold back for null blocks: one block of each
+    fixed-width pool, or one block of the legacy shared pool."""
+    if not _uses_multiple_pools(vllm_config, kv_cache_groups):
+        return _pool_bytes_per_block(vllm_config, kv_cache_groups)
+    return sum(
+        width for width, _group_ids in _get_physical_pool_groups(kv_cache_groups)
     )
-
-
-def _null_block_bytes(kv_cache_groups: list[KVCacheGroupSpec]) -> int:
-    """Physical bytes reserved by one null block in each fixed-width pool."""
     return sum(
         width for width, _group_ids in _get_physical_pool_groups(kv_cache_groups)
     )
@@ -838,6 +835,35 @@ def _uses_dedicated_hidden_state_pool(vllm_config: VllmConfig) -> bool:
     )
 
 
+def _uses_multiple_pools(
+    vllm_config: VllmConfig, kv_cache_groups: list[KVCacheGroupSpec]
+) -> bool:
+    """Whether the groups get fixed-width physical pools instead of one shared
+    pool.
+
+    Only groups the packing pass deliberately padded (physical_bytes_per_block
+    annotated) split; differing raw page sums mean overlaying groups that share
+    one pool, as upstream does.
+    """
+    widths = {_get_group_bytes_per_block(group) for group in kv_cache_groups}
+    if len(widths - {0}) <= 1:
+        return False
+    if _uses_dedicated_hidden_state_pool(vllm_config):
+        return True
+    annotated = any(
+        group.physical_bytes_per_block is not None for group in kv_cache_groups
+    )
+    if annotated and _is_hidden_states_export(vllm_config):
+        logger.warning_once(
+            "Hidden-state export (ExampleHiddenStatesConnector + "
+            "extract_hidden_states) forces the legacy single shared KV cache "
+            "pool; heterogeneous-width physical subpools are disabled for "
+            "this offline export only."
+        )
+        return False
+    return annotated
+
+
 def get_kv_cache_config_from_groups(
     vllm_config: VllmConfig,
     kv_cache_groups: list[KVCacheGroupSpec],
@@ -874,30 +900,14 @@ def get_kv_cache_config_from_groups(
 
     layout = vllm_config.cache_config.get_resolved_kv_cache_layout()
     group_widths = [_get_group_bytes_per_block(group) for group in kv_cache_groups]
-    # Split into fixed-width physical pools only for groups the packing pass
-    # deliberately padded (physical_bytes_per_block annotated); differing raw
-    # page sums mean overlaying groups that share one pool, as upstream does.
-    has_mixed_widths = len({width for width in group_widths if width > 0}) > 1
-    uses_multiple_pools = has_mixed_widths and any(
-        group.physical_bytes_per_block is not None for group in kv_cache_groups
-    )
+    uses_multiple_pools = _uses_multiple_pools(vllm_config, kv_cache_groups)
+    # ExampleHiddenStatesConnector receives block IDs for every cache group and
+    # only exports its dedicated hidden-state group. Unlike generic connectors,
+    # it is therefore safe to keep that BF16 output cache separate from the
+    # verifier's quantized KV pools.
     dedicated_hidden_state_pool = (
-        has_mixed_widths and _uses_dedicated_hidden_state_pool(vllm_config)
+        uses_multiple_pools and _uses_dedicated_hidden_state_pool(vllm_config)
     )
-    if dedicated_hidden_state_pool:
-        # ExampleHiddenStatesConnector receives block IDs for every cache
-        # group and only exports its dedicated hidden-state group. Unlike
-        # generic connectors, it is therefore safe to keep that BF16 output
-        # cache separate from the verifier's quantized KV pools.
-        uses_multiple_pools = True
-    elif uses_multiple_pools and _is_hidden_states_export(vllm_config):
-        logger.warning(
-            "Hidden-state export (ExampleHiddenStatesConnector + "
-            "extract_hidden_states) forces the legacy single shared KV cache "
-            "pool; heterogeneous-width physical subpools are disabled for "
-            "this offline export only."
-        )
-        uses_multiple_pools = False
     if uses_multiple_pools:
         transfer_config = vllm_config.kv_transfer_config
         if (
