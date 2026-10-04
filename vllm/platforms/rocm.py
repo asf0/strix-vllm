@@ -503,6 +503,11 @@ def _get_backend_priorities(
             ]
 
     backends = []
+    # gfx1151's tuned Triton unified attention outruns ROCM_ATTN's paged
+    # decode and supports every KV cache dtype, so prefer it there.
+    prefer_triton = on_gfx1151()
+    if prefer_triton:
+        backends.append(AttentionBackendEnum.TRITON_ATTN)
     # Keep ROCM_ATTN disabled for KV connectors until connector transfer
     # semantics are validated for its asymmetric native K/V cache views.
     if not use_kv_connector:
@@ -513,7 +518,8 @@ def _get_backend_priorities(
         backends.append(AttentionBackendEnum.ROCM_AITER_UNIFIED_ATTN)
     elif rocm_aiter_ops.is_rdna_aiter_enabled():
         backends.insert(0, AttentionBackendEnum.ROCM_AITER_UNIFIED_ATTN)
-    backends.append(AttentionBackendEnum.TRITON_ATTN)
+    if not prefer_triton:
+        backends.append(AttentionBackendEnum.TRITON_ATTN)
     backends.append(AttentionBackendEnum.TURBOQUANT)
     backends.append(AttentionBackendEnum.ULTRAQUANT)
 

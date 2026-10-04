@@ -31,7 +31,10 @@ def mock_vllm_config():
 @pytest.fixture
 def mock_get_cdna_version():
     """Mock cdna version arch detection to return True."""
-    with patch("vllm.platforms.rocm.get_cdna_version", return_value=3):
+    with (
+        patch("vllm.platforms.rocm.get_cdna_version", return_value=3),
+        patch("vllm.platforms.rocm.on_gfx1151", return_value=False),
+    ):
         yield
 
 
@@ -437,6 +440,29 @@ def test_standard_attention_backend_selection(
     )
 
     assert backend_path == expected_backend_path
+
+
+@pytest.mark.parametrize("kv_cache_dtype", ["auto", "int8_per_token_head"])
+def test_gfx1151_defaults_to_triton_attn(kv_cache_dtype):
+    """gfx1151 auto-selects its tuned TRITON_ATTN ahead of ROCM_ATTN."""
+    from vllm.platforms.rocm import RocmPlatform
+
+    attn_selector_config = AttentionSelectorConfig(
+        head_size=256,
+        dtype=torch.bfloat16,
+        kv_cache_dtype=kv_cache_dtype,
+        block_size=16,
+        use_mla=False,
+        has_sink=False,
+        use_sparse=False,
+        use_dcp=False,
+    )
+    with patch("vllm.platforms.rocm.on_gfx1151", return_value=True):
+        backend_path = RocmPlatform.get_attn_backend_cls(
+            selected_backend=None, attn_selector_config=attn_selector_config
+        )
+
+    assert backend_path == AttentionBackendEnum.TRITON_ATTN.get_path()
 
 
 @pytest.mark.parametrize("use_dcp", [False, True])
