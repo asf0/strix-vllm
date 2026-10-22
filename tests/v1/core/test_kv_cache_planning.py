@@ -36,6 +36,7 @@ from vllm.v1.core.kv_cache_planning import (
     kv_cache_groups_tp_replicas,
 )
 from vllm.v1.core.kv_cache_utils import (
+    get_kv_cache_capacity,
     generate_scheduler_kv_cache_config,
 )
 from vllm.v1.hisparse.layout import (
@@ -2320,6 +2321,8 @@ def test_pipeline_parallel_rejects_different_heterogeneous_pool_layouts(
         "get_kv_cache_groups",
         lambda _config, _specs: global_groups,
     )
+    # Mirror the packing pass's padding annotation so the pool path engages.
+    global_groups[0].physical_bytes_per_block = 2 * spec.page_size_bytes
     vllm_config = VllmConfig(model_config=ModelConfig(max_model_len=16))
     vllm_config.cache_config.kv_cache_layout = "BLHNC"
 
@@ -2361,6 +2364,13 @@ def _qwen35_mtp_hybrid_specs():
     return specs
 
 
+@pytest.mark.parametrize(
+    ("cache_dtype", "hidden_block_size", "pool_group_ids"),
+    [
+        ("int8_per_token_head", 544, [(0, 1, 2), (3,)]),
+        ("auto", 136, []),
+    ],
+)
 def test_hidden_state_export_pool_follows_kv_cache_quantization(
     cache_dtype, hidden_block_size, pool_group_ids
 ):
@@ -2400,8 +2410,6 @@ def test_hidden_state_export_pool_follows_kv_cache_quantization(
     )
     pools = config.kv_cache_pools or []
     assert [pool.group_ids for pool in pools] == pool_group_ids
-
-
 def test_qwen35_mtp_draft_group_gets_narrow_pool():
     """Qwen3.8-27B pads GDN state pages to the attention page, so its groups
     come from the uniform-page path. The one-layer MTP group must get its own
@@ -2451,3 +2459,21 @@ def test_qwen35_mtp_draft_group_gets_narrow_pool():
         (tuple(i for i in range(len(groups)) if i != draft_id), 16 * page),
         ((draft_id,), page),
     ]
+
+
+def _spec_decode_grouping_config(method="dspark", model_type=None):
+    """Grouping config with an EAGLE-family speculative method enabled."""
+    return SimpleNamespace(
+        scheduler_config=SimpleNamespace(disable_hybrid_kv_cache_manager=False),
+        cache_config=SimpleNamespace(
+            get_resolved_kv_cache_layout=lambda: SimpleNamespace(
+                is_block_outermost=True
+            )
+        ),
+        model_config=SimpleNamespace(hf_config=SimpleNamespace(model_type=model_type)),
+        speculative_config=SimpleNamespace(
+            method=method,
+            use_eagle=lambda: True,
+            use_eagle_block_drop=lambda: True,
+        ),
+    )

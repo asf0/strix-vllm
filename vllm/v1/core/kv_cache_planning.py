@@ -184,9 +184,9 @@ def check_enough_kv_cache_memory(
         )
         _check_enough_kv_cache_memory(
             check_memory,
-            partial(_max_memory_usage_bytes_from_groups, vllm_config, groups),
+            lambda: max_memory_usage_bytes(vllm_config, kv_cache_spec.values()),
             vllm_config.model_config.max_model_len,
-            partial(_estimate_max_model_len_from_groups, vllm_config, groups),
+            lambda am: estimate_max_model_len(vllm_config, kv_cache_spec, am),
         )
 
 
@@ -1793,7 +1793,7 @@ def _project_kv_cache_groups_to_worker(
             KVCacheGroupSpec(
                 worker_layer_names,
                 group_spec,
-                is_eagle_group=group.is_eagle_group and bool(worker_layer_names),
+                is_eagle_group=group.is_eagle_group,
                 host_resident=group.host_resident,
                 enable_kv_transfer=group.enable_kv_transfer,
                 role=group.role,
@@ -1894,13 +1894,18 @@ def get_kv_cache_configs(
         tuple(_get_group_bytes_per_block(group) for group in groups)
         for groups in projected_groups_per_worker
     ]
+    # Only the deliberate padding annotation splits pools on a worker; differing
+    # raw page sums on their own overlay into the legacy shared pool, and such a
+    # layout projects across pipeline stages like it always did.
+    annotated_pools = any(
+        group.physical_bytes_per_block is not None
+        for groups in projected_groups_per_worker
+        for group in groups
+    )
     if (
         len(projected_widths) > 1
+        and annotated_pools
         and len(set(projected_widths)) > 1
-        and any(
-            len({width for width in widths if width > 0}) > 1
-            for widths in projected_widths
-        )
     ):
         raise NotImplementedError(
             "Pipeline-parallel workers with different heterogeneous-width "
