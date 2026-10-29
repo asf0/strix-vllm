@@ -331,6 +331,53 @@ def _hc_combine_norm_kernel(
     tl.store(y_ptr + row * stride_y + offs, y, mask_inner)
 
 
+@triton.jit
+def _hc_combine_norm_rows_kernel(
+    block_ptr,
+    res_ptr,
+    inj_ptr,
+    w_ptr,
+    out_ptr,
+    y_ptr,
+    stride_block,
+    stride_res,
+    stride_inj,
+    stride_out,
+    stride_y,
+    HC_DIM: tl.constexpr,
+    HC: tl.constexpr,
+    W_SHARED: tl.constexpr,
+    EPS: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+) -> None:
+    # One program per row, streams in turn: the block output and shared norm
+    # weight are read once per row instead of once per stream.
+    row = tl.program_id(0).to(tl.int64)
+    offs = tl.arange(0, BLOCK_SIZE)
+    mask = offs < HC_DIM
+    block = tl.load(block_ptr + row * stride_block + offs, mask, other=0.0)
+    block = block.to(tl.float32)
+    if W_SHARED:
+        w_shared = tl.load(w_ptr + offs, mask, other=0.0).to(tl.float32)
+    for stream in tl.static_range(HC):
+        offs_s = stream * HC_DIM + offs
+        res = tl.load(res_ptr + row * stride_res + offs_s, mask, other=0.0)
+        inj = tl.load(inj_ptr + row * stride_inj + stream).to(tl.float32)
+        inj = 2.0 * tl.sigmoid(inj / HC)
+        # Same rounding point as _hc_combine_norm_kernel.
+        out = (res.to(tl.float32) + block * inj).to(out_ptr.dtype.element_ty)
+        tl.store(out_ptr + row * stride_out + offs_s, out, mask=mask)
+        out = out.to(tl.float32)
+        rrms = tl.rsqrt(tl.sum(out * out, axis=0) / HC_DIM + EPS)
+        if W_SHARED:
+            w = w_shared
+        else:
+            w = tl.load(w_ptr + offs_s, mask, other=0.0).to(tl.float32)
+        y = out * rrms
+        y += y * w
+        tl.store(y_ptr + row * stride_y + offs_s, y, mask)
+
+
 def _hc_combine_norm(
     residual: torch.Tensor,
     block_output: torch.Tensor,
@@ -352,6 +399,28 @@ def _hc_combine_norm(
 
     out = residual.new_empty(residual.shape)
     y = residual.new_empty(residual.shape)
+    if current_platform.is_rocm() and N >= 512:
+        # gfx1151, 16k rows: 9.2 -> 5.2 ms. Decode keeps the per-stream grid.
+        _hc_combine_norm_rows_kernel[(N,)](
+            block_output,
+            residual,
+            injection_logits,
+            norm_weight,
+            out,
+            y,
+            block_output.stride(0),
+            residual.stride(0),
+            injection_logits.stride(0),
+            out.stride(0),
+            y.stride(0),
+            hc_dim,
+            hc_count,
+            W_SHARED=norm_weight.numel() == hc_dim,
+            EPS=eps,
+            BLOCK_SIZE=triton.next_power_of_2(hc_dim),
+            num_warps=16,
+        )
+        return out, y
     BLOCK_SIZE = 512
     _hc_combine_norm_kernel[(N, hc_count)](
         block_output,
