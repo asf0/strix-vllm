@@ -818,6 +818,16 @@ class Qwen4ExpPLEDiskEmbedding(Qwen4ExpPLEEmbedding):
         """Copy the table rows of host ``ids`` into ``staging`` on the pool."""
         assert self._pool is not None and self._row_starts is not None
         num_rows = ids.numel()
+        if _DISK_VERIFY:
+            # A bad id here means the producer wrote nothing (or garbage):
+            # name that instead of an IndexError on the shard table.
+            lo, hi = int(ids.min()), int(ids.max())
+            if lo < 0 or hi >= self.org_vocab_size:
+                raise RuntimeError(
+                    f"PLE disk gather: n-gram ids out of range [{lo}, {hi}] for a "
+                    f"table of {self.org_vocab_size} rows; the ids op did not "
+                    "fill its output"
+                )
         file_rows = self._row_starts[ids // self._shard_rows] + ids % self._shard_rows
         step = max(self._MIN_ROWS_PER_TASK, -(-num_rows // self._GATHER_THREADS))
         tasks = [
