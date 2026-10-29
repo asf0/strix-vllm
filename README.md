@@ -19,6 +19,41 @@ For events, please visit [vllm.ai/events](https://vllm.ai/events) to join us.
 
 ---
 
+## This fork: vLLM on AMD Strix Halo (gfx1151)
+
+`gfx1151` is upstream vLLM plus a small set of commits for running Qwen3.8 models on a
+128 GB Strix Halo APU. The gfx1151 kernels themselves live out of tree in
+[libstrix](https://github.com/asf0/libstrix), a vLLM plugin. This branch carries only the
+changes that a plugin can't make:
+
+- **KV-cache subpools.** Physical KV pools of different widths, so layer groups with
+  different page sizes (attention, GDN state, MTP draft, hidden-state export) don't pad
+  to the widest one. Includes a narrow pool for the MTP draft group, a dedicated pool
+  for quantized hidden-state export (DFlash), aligned block strides, and per-pool
+  null-block reservation.
+- **GDN under speculative decoding** (`--use-replayssm`). One GatedDeltaNet state per
+  request instead of one per verification position: accepted tokens are replayed onto
+  the checkpoint, bitwise identical to the per-slot path, with about 470 MB less state
+  on Qwen3.8-27B at MTP k=2.
+- **Qwen3.8-Flash-Next.** The 102 GB engram n-gram table is streamed from disk
+  (`engram_config={"disk_offload": true}`), and the next chunk's rows are prefetched into
+  the page cache. The model also gets a gfx1151 prefill path, and the
+  hyper-connection up projection and QSA indexer are behind swappable ops for libstrix.
+  See [docs/features/engram.md](docs/features/engram.md#running-qwen38-flash-next-on-gfx1151-with-libstrix).
+
+Qwen3.8-Flash-Next AWQ W4A16 with libstrix, single stream, 16k prefill chunks, MTP 2:
+
+| Prompt | Prefill tok/s | Decode tok/s |
+|---|---|---|
+| 5.6k | 1,539 | 43 |
+| 26.9k | 1,617 | 43 |
+| 100.5k | 1,572 | 40 |
+
+Before this work, the same setup reached 684 to 806 tok/s prefill and about 18 tok/s
+decode. Perplexity is 1.96 on wikitext-2.
+
+---
+
 ## About
 
 vLLM is a fast and easy-to-use library for LLM inference and serving.
