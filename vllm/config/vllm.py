@@ -1921,6 +1921,22 @@ class VllmConfig:
                     )
                     self.compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
 
+            if (
+                self.engram_config is not None
+                and self.engram_config.disk_offload
+                and current_platform.is_rocm()
+                and self.compilation_config.cudagraph_mode.has_full_cudagraphs()
+            ):
+                # The CUDA path reads rows into fixed device buffers and keeps
+                # full graphs; the ROCm path gathers them on the host.
+                logger.warning_once(
+                    "Engram disk_offload gathers table rows on the host, which "
+                    "full CUDA graphs cannot capture. Overriding cudagraph_mode "
+                    "from %s to PIECEWISE.",
+                    self.compilation_config.cudagraph_mode.name,
+                )
+                self.compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
+
             # disable cudagraph when enforce eager execution
             if self.model_config is not None and self.model_config.enforce_eager:
                 logger.info_once("Cudagraph is disabled under eager mode")
