@@ -21,6 +21,14 @@ _TOPK_WORKSPACE_BYTES = 1024 * 1024
 _ROWS_KERNEL_PROFILES = {3: (32, 32, 4), 4: (128, 128, 2)}
 
 
+def _on_rdna() -> bool:
+    if not current_platform.is_rocm():
+        return False
+    from vllm.platforms.rocm import on_gfx1x
+
+    return on_gfx1x()
+
+
 @triton.jit
 def _qsa_mqa_paged_kernel(
     q_ptr,
@@ -355,9 +363,15 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     IS_FP8: tl.constexpr,
+    HEADS_FIRST: tl.constexpr = False,
 ) -> None:
-    row = tl.program_id(0)
-    kv_head = tl.program_id(1)
+    if HEADS_FIRST:
+        # Grid (kv_heads, rows, splits): a row's heads run back to back.
+        kv_head = tl.program_id(0)
+        row = tl.program_id(1)
+    else:
+        row = tl.program_id(0)
+        kv_head = tl.program_id(1)
     split_id = tl.program_id(2)
     request = tl.load(token_to_req_ptr + row)
     safe_request = tl.minimum(tl.maximum(request, 0), num_requests - 1)
@@ -1085,6 +1099,7 @@ def qsa_sparse_paged_attention(
         block_m = max(block_m, 16)
     small_profile_limit = 8 if block_m <= 8 else 4
 
+    heads_first = False
     if cdna_bf16 and base_programs >= 32:
         # Narrow tiles, one warp, and enough splits for about 2048 programs.
         # CDNA4 decode prefers about 1024 programs with four warps.
@@ -1105,6 +1120,13 @@ def qsa_sparse_paged_attention(
         block_n, target_splits, partial_warps = 64, 8, 2
     elif base_programs <= 512:
         block_n, target_splits, partial_warps = 64, 4, 2
+    elif _on_rdna():
+        # gfx1151, 16k-row prefill: 2.6x over the 64-column tile. The gather
+        # is latency-bound and the narrow tile fits more programs per CU.
+        block_n, target_splits, partial_warps = 16, 1, 4
+        # A token's K/V rows of both KV heads share 1 KiB; fetching them back
+        # to back is another 1.05x (16k context) to 1.9x (128k).
+        heads_first = True
     else:
         block_n, target_splits, partial_warps = 64, 1, 2
         if cdna_version in (3, 4):
@@ -1135,7 +1157,11 @@ def qsa_sparse_paged_attention(
             device=q.device,
         )
 
-    partial_grid = (q.shape[0], k_cache.shape[2], num_splits)
+    partial_grid = (
+        (k_cache.shape[2], q.shape[0], num_splits)
+        if heads_first
+        else (q.shape[0], k_cache.shape[2], num_splits)
+    )
     _qsa_sparse_paged_gqa_splitk_kernel[partial_grid](
         q,
         k_cache,
@@ -1172,6 +1198,7 @@ def qsa_sparse_paged_attention(
         BLOCK_M=block_m,
         BLOCK_N=block_n,
         IS_FP8=is_fp8,
+        HEADS_FIRST=heads_first,
         num_warps=partial_warps,
         num_stages=partial_stages,
     )
