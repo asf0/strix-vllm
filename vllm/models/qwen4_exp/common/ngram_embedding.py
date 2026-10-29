@@ -16,11 +16,13 @@ import os
 import re
 import struct
 import threading
+import time
 import warnings
 from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor
 from typing import ClassVar
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -638,6 +640,12 @@ def _read_safetensors_header(path: str) -> tuple[int, dict]:
     return 8 + header_len, header
 
 
+# Per-lookup timing of the disk gather, for profiling.
+_DISK_TIMING = os.environ.get("VLLM_PLE_DISK_TIMING", "0") == "1"
+# Compare host-computed n-gram ids against the GPU ones (syncs every step).
+_DISK_VERIFY = os.environ.get("VLLM_PLE_DISK_VERIFY", "0") == "1"
+
+
 class Qwen4ExpPLEDiskEmbedding(Qwen4ExpPLEEmbedding):
     """PLE table left in the checkpoint and read through a read-only mmap.
 
@@ -646,7 +654,7 @@ class Qwen4ExpPLEDiskEmbedding(Qwen4ExpPLEEmbedding):
     parallel gather threads keep several disk reads in flight.
     """
 
-    _GATHER_THREADS: ClassVar[int] = 32
+    _GATHER_THREADS: ClassVar[int] = 64
     _MIN_ROWS_PER_TASK: ClassVar[int] = 64
 
     def __init__(
@@ -691,6 +699,14 @@ class Qwen4ExpPLEDiskEmbedding(Qwen4ExpPLEEmbedding):
         self._ids_host: torch.Tensor | None = None
         self._staging: torch.Tensor | None = None
         self._pool: ThreadPoolExecutor | None = None
+        # Host-side prefetch (prefetch_host_ids): two pinned staging buffers,
+        # each guarded by the event recorded after its upload, and one
+        # coordinator thread so the gather runs while the GPU is busy.
+        self._prefetch_staging: list[torch.Tensor] = []
+        self._prefetch_events: list[torch.cuda.Event] = []
+        self._prefetch_slot = 0
+        self._coordinator: ThreadPoolExecutor | None = None
+        self._pending: tuple | None = None
 
     def allocate_embedding_weight(
         self,
@@ -797,6 +813,64 @@ class Qwen4ExpPLEDiskEmbedding(Qwen4ExpPLEEmbedding):
         with torch.inference_mode():
             torch.index_select(self._rows, 0, file_rows, out=out)
 
+    def _gather_rows(self, ids: torch.Tensor, staging: torch.Tensor) -> None:
+        """Copy the table rows of host ``ids`` into ``staging`` on the pool."""
+        assert self._pool is not None and self._row_starts is not None
+        num_rows = ids.numel()
+        file_rows = self._row_starts[ids // self._shard_rows] + ids % self._shard_rows
+        step = max(self._MIN_ROWS_PER_TASK, -(-num_rows // self._GATHER_THREADS))
+        tasks = [
+            self._pool.submit(
+                self._gather,
+                file_rows[start : start + step],
+                staging[start : start + step],
+            )
+            for start in range(step, num_rows, step)
+        ]
+        self._gather(file_rows[:step], staging[:step])
+        for task in tasks:
+            task.result()
+
+    def _prefetch_task(
+        self, ids: torch.Tensor, staging: torch.Tensor, event: torch.cuda.Event
+    ) -> float:
+        # The previous upload from this buffer must finish before it is
+        # overwritten. An event that was never recorded returns at once.
+        event.synchronize()
+        t0 = time.perf_counter()
+        self._gather_rows(ids, staging)
+        return time.perf_counter() - t0
+
+    def prefetch_host_ids(self, ids: np.ndarray) -> None:
+        """Start gathering the rows of host-computed n-gram ids [T, heads].
+
+        The next forward with the same id shape uses these rows instead of
+        copying its ids to the host, so the gather overlaps the GPU work queued
+        before it instead of following a stream sync.
+        """
+        if self._rows is None:
+            self._map_table()
+        if ids.size > self._max_rows:
+            self._pending = None
+            return
+        if not self._prefetch_staging:
+            row_bytes = self._staging.shape[1]
+            for _ in range(2):
+                self._prefetch_staging.append(
+                    torch.empty(
+                        self._max_rows, row_bytes, dtype=torch.uint8, pin_memory=True
+                    )
+                )
+                self._prefetch_events.append(torch.cuda.Event())
+            self._coordinator = ThreadPoolExecutor(1, thread_name_prefix="ple-prefetch")
+        self._prefetch_slot ^= 1
+        staging = self._prefetch_staging[self._prefetch_slot][: ids.size]
+        event = self._prefetch_events[self._prefetch_slot]
+        host_ids = torch.from_numpy(ids.reshape(-1))
+        assert self._coordinator is not None
+        future = self._coordinator.submit(self._prefetch_task, host_ids, staging, event)
+        self._pending = (ids.shape, host_ids, future, staging, event)
+
     def start_prefetch(self, ngram_ids: torch.Tensor) -> None:
         raise RuntimeError("Disk PLE embedding does not support prefetch")
 
@@ -814,26 +888,54 @@ class Qwen4ExpPLEDiskEmbedding(Qwen4ExpPLEEmbedding):
             raise ValueError(
                 f"PLE lookup of {num_rows} rows exceeds the {self._max_rows} budget"
             )
+        pending, self._pending = self._pending, None
+        if pending is not None and tuple(pending[0]) == tuple(ngram_ids.shape):
+            return self._finish_prefetch(ngram_ids, *pending[1:])
+        t0 = time.perf_counter() if _DISK_TIMING else 0.0
         ids = self._ids_host[:num_rows]
         ids.copy_(ngram_ids.reshape(-1), non_blocking=True)
         # Also orders this step's staging writes after the previous upload.
         torch.cuda.current_stream().synchronize()
-        file_rows = self._row_starts[ids // self._shard_rows] + ids % self._shard_rows
+        t1 = time.perf_counter() if _DISK_TIMING else 0.0
         staging = self._staging[:num_rows]
-        step = max(self._MIN_ROWS_PER_TASK, -(-num_rows // self._GATHER_THREADS))
-        tasks = [
-            self._pool.submit(
-                self._gather,
-                file_rows[start : start + step],
-                staging[start : start + step],
+        self._gather_rows(ids, staging)
+        if _DISK_TIMING:
+            t2 = time.perf_counter()
+            logger.info(
+                "PLE disk gather: %d rows, sync %.1f ms, gather %.1f ms",
+                num_rows,
+                (t1 - t0) * 1e3,
+                (t2 - t1) * 1e3,
             )
-            for start in range(step, num_rows, step)
-        ]
-        self._gather(file_rows[:step], staging[:step])
-        for task in tasks:
-            task.result()
         rows = staging.view(self.weight.dtype).view(*ngram_ids.shape, -1)
         return rows.to(ngram_ids.device, non_blocking=True)
+
+    def _finish_prefetch(
+        self,
+        ngram_ids: torch.Tensor,
+        host_ids: torch.Tensor,
+        future,
+        staging: torch.Tensor,
+        event: torch.cuda.Event,
+    ) -> torch.Tensor:
+        t0 = time.perf_counter() if _DISK_TIMING else 0.0
+        gather_s = future.result()
+        if _DISK_TIMING:
+            logger.info(
+                "PLE disk prefetch: %d rows, gather %.1f ms, waited %.1f ms",
+                host_ids.numel(),
+                gather_s * 1e3,
+                (time.perf_counter() - t0) * 1e3,
+            )
+        if _DISK_VERIFY:
+            gpu_ids = ngram_ids.reshape(-1).cpu()
+            bad = int((gpu_ids != host_ids).sum())
+            if bad:
+                logger.warning("PLE host n-gram ids: %d of %d differ", bad, gpu_ids.numel())
+        rows = staging.view(self.weight.dtype).view(*ngram_ids.shape, -1)
+        rows = rows.to(ngram_ids.device, non_blocking=True)
+        event.record()
+        return rows
 
 
 @triton.jit
