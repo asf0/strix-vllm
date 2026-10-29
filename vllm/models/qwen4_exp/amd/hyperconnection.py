@@ -39,8 +39,8 @@ from .ops.hc import (
     grouped_gemma_rmsnorm,
     hc_combine,
     hc_combine_norm,
-    hc_gate_mix,
     hc_silu,
+    hc_up_gate_mix,
 )
 
 
@@ -144,8 +144,11 @@ class GatedResidual(nn.Module):
             injection = None
 
         lowrank = hc_silu(lowrank, self.hc_count)
-        gate = self.input_mix_weight_up(lowrank)  # [M, D]
-        block_input = hc_gate_mix(xn, gate, self.hc_count)
+        # input_mix_weight_up is unquantized (quant_config=None): its weight
+        # feeds the fused up-projection + gated mix directly.
+        block_input = hc_up_gate_mix(
+            xn, lowrank, self.input_mix_weight_up.weight, self.hc_count
+        )
 
         return hidden_states, block_input, injection
 
@@ -180,8 +183,11 @@ class GatedResidual(nn.Module):
             injection = None
 
         lowrank = hc_silu(lowrank, self.hc_count)
-        gate = self.input_mix_weight_up(lowrank)  # [M, D]
-        block_input = hc_gate_mix(xn, gate, self.hc_count)
+        # input_mix_weight_up is unquantized (quant_config=None): its weight
+        # feeds the fused up-projection + gated mix directly.
+        block_input = hc_up_gate_mix(
+            xn, lowrank, self.input_mix_weight_up.weight, self.hc_count
+        )
 
         return hidden_states, block_input, injection
 
