@@ -3,6 +3,7 @@
 """Inference-only Qwen4Exp model."""
 
 from collections.abc import Iterable
+from functools import cached_property
 from itertools import islice
 
 import torch
@@ -77,6 +78,7 @@ from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.kv_cache_interface import MambaSpec
 
 from ..common.hyperconnection import is_hc_sequence_parallel_enabled
+from ..common.ngram_embedding import Qwen4ExpPLEDiskEmbedding, is_ple_table_weight
 from .hyperconnection import GatedResidual, HyperConnectionConfig
 from .low_latency_gemm import enable_qwen4_exp_low_latency_gemm
 from .ops.sequence_parallel import sp_reduce_scatter, sp_shard
@@ -647,6 +649,18 @@ class Qwen4ExpModel(nn.Module):
         return loaded
 
 
+class Qwen4ExpDiskPLEWeights:
+    """Skip checkpoint files holding only disk-offloaded PLE table rows."""
+
+    @cached_property
+    def _ple_table_on_disk(self) -> bool:
+        assert isinstance(self, nn.Module)
+        return any(isinstance(m, Qwen4ExpPLEDiskEmbedding) for m in self.modules())
+
+    def is_unused_checkpoint_weight(self, name: str) -> bool:
+        return self._ple_table_on_disk and is_ple_table_weight(name)
+
+
 class Qwen4ExpForCausalLM(
     nn.Module,
     HasInnerState,
@@ -655,6 +669,7 @@ class Qwen4ExpForCausalLM(
     SupportsMRoPE,
     SupportsPP,
     Qwen4ExpMixtureOfExperts,
+    Qwen4ExpDiskPLEWeights,
     IsHybrid,
 ):
     packed_modules_mapping = {
@@ -885,6 +900,7 @@ class Qwen4ExpForConditionalGeneration(
     HasInnerState,
     SupportsHCSP,
     Qwen4ExpMixtureOfExperts,
+    Qwen4ExpDiskPLEWeights,
 ):
     """Qwen3-VL vision tower backed by the Qwen4Exp language model."""
 

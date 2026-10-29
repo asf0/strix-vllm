@@ -8,6 +8,7 @@ import torch
 from torch import nn
 from transformers import Qwen4ExpTextConfig
 
+from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import CacheConfig, ModelConfig, VllmConfig, get_current_vllm_config
 from vllm.distributed import get_etp_group, get_tp_group
 from vllm.forward_context import get_forward_context
@@ -39,6 +40,8 @@ from vllm.v1.attention.backends.short_conv_attn import (
 
 from ..common.ngram_embedding import (
     Qwen4ExpPLEDeviceEmbedding,
+    Qwen4ExpPLEDiskEmbedding,
+    Qwen4ExpPLEEmbedding,
     Qwen4ExpPLEEmbeddingMethod,
     Qwen4ExpPLENvFp4EmbeddingMethod,
     Qwen4ExpPLEPinnedHostEmbedding,
@@ -258,11 +261,13 @@ class Qwen4ExpNGramEmbedding(nn.Module):
                 "checkpoint with a BF16 or FP8 PLE table."
             )
         engram_config = get_current_vllm_config().engram_config
-        embedding_cls = (
-            Qwen4ExpPLEPinnedHostEmbedding
-            if engram_config is not None and engram_config.cpu_offload
-            else Qwen4ExpPLEDeviceEmbedding
-        )
+        embedding_cls: type[Qwen4ExpPLEEmbedding]
+        if engram_config is not None and engram_config.disk_offload:
+            embedding_cls = Qwen4ExpPLEDiskEmbedding
+        elif engram_config is not None and engram_config.cpu_offload:
+            embedding_cls = Qwen4ExpPLEPinnedHostEmbedding
+        else:
+            embedding_cls = Qwen4ExpPLEDeviceEmbedding
         # A TP reduce-scatter covers all vocabulary owners only when ETP=TP.
         self.use_reduce_scatter = (
             self.use_sequence_parallel
@@ -323,7 +328,17 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             self.layer_name,
         )
         embedding = self.ngram_embedding
-        if embedding.supports_prefetch:
+        if isinstance(embedding, Qwen4ExpPLEDiskEmbedding):
+            output = ngram_ids.new_empty(
+                (ngram_ids.shape[0], self.embedding_dim),
+                dtype=embedding.weight.dtype,
+            )
+            torch.ops.vllm.qwen4_exp_amd_ple_ngram_embedding_disk(
+                ngram_ids,
+                output,
+                self.layer_name,
+            )
+        elif embedding.supports_prefetch:
             output = ngram_ids.new_empty(
                 (ngram_ids.shape[0], self.embedding_dim),
                 dtype=embedding.weight.dtype,
@@ -373,6 +388,8 @@ class Qwen4ExpNGramEmbedding(nn.Module):
                 loaded.add(name)
                 continue
             if name.startswith(shard_prefix) and name.endswith(".weight"):
+                if isinstance(self.ngram_embedding, Qwen4ExpPLEDiskEmbedding):
+                    continue
                 shard_text = name[len(shard_prefix) : -len(".weight")]
                 if not shard_text.isdigit():
                     regular_weights.append((name, loaded_weight))
@@ -410,6 +427,9 @@ class Qwen4ExpNGramEmbedding(nn.Module):
 
         if regular_weights:
             loaded.update(AutoWeightsLoader(self).load_weights(regular_weights))
+        if isinstance(self.ngram_embedding, Qwen4ExpPLEDiskEmbedding):
+            # The rows are read from the checkpoint at lookup time.
+            loaded.add("ngram_embedding.weight")
         return loaded
 
 
@@ -841,6 +861,22 @@ def qwen4_exp_amd_ple_ngram_embedding_pinned(
     output.copy_(result)
 
 
+def qwen4_exp_amd_ple_ngram_embedding_disk(
+    ngram_ids: torch.Tensor,
+    output: torch.Tensor,
+    layer_name: str,
+) -> None:
+    """Gather disk-offloaded PLE rows on the host.
+
+    The lookup synchronizes the device, so this op is a CUDA graph splitting op.
+    """
+    layer = get_forward_context().no_compile_layers[layer_name]
+    if not isinstance(layer, Qwen4ExpPLELayer):
+        raise TypeError(f"{layer_name} is not a Qwen4Exp PLE owner")
+    result = layer.ple_embedding.ngram_embedding(ngram_ids).flatten(-2)
+    output.copy_(result)
+
+
 def qwen4_exp_ple_short_conv(
     inputs: torch.Tensor,
     residual: torch.Tensor,
@@ -890,6 +926,13 @@ direct_register_custom_op(
 direct_register_custom_op(
     op_name="qwen4_exp_amd_ple_ngram_embedding_pinned",
     op_func=qwen4_exp_amd_ple_ngram_embedding_pinned,
+    mutates_args=["output"],
+)
+
+
+direct_register_custom_op(
+    op_name="qwen4_exp_amd_ple_ngram_embedding_disk",
+    op_func=eager_break_during_capture(qwen4_exp_amd_ple_ngram_embedding_disk),
     mutates_args=["output"],
 )
 

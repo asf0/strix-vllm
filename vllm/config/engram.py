@@ -54,8 +54,19 @@ class EngramConfig:
     effort, falls back to ordinary pinned pages). Prefaulting the tables at
     startup takes longer. Requires cpu_offload without dp_shared_memory."""
 
+    disk_offload: bool = False
+    """Leave the tables in the checkpoint's safetensors files and read rows on
+    demand through a read-only memory map, so tables larger than host memory
+    stay on disk while the page cache keeps hot rows. Takes precedence over
+    cpu_offload. Lookups sync the host, so full CUDA graphs fall back to
+    piecewise. Supported for Qwen4Exp with TP=1."""
+
     @model_validator(mode="after")
     def _validate_shared_memory(self) -> Self:
+        if self.disk_offload and (self.dp_shared_memory or self.use_thp):
+            raise ValueError(
+                "disk_offload is incompatible with dp_shared_memory and use_thp"
+            )
         if self.dp_shared_memory and not self.cpu_offload:
             raise ValueError("dp_shared_memory requires cpu_offload=True")
         if self.use_thp and (not self.cpu_offload or self.dp_shared_memory):
@@ -80,12 +91,15 @@ class EngramConfig:
                 "EngramConfig requires a model with supported Engram "
                 "embeddings and non-empty n-gram layer ids."
             )
+        if self.disk_offload and not model_config.architecture.startswith("Qwen4Exp"):
+            raise ValueError("Engram disk_offload is only supported for Qwen4Exp")
 
     def resolve_dp_shared_memory(self, parallel_config: "ParallelConfig") -> None:
         """Share host tables by default wherever the configuration permits."""
         if self.dp_shared_memory is None:
             self.dp_shared_memory = (
                 self.cpu_offload
+                and not self.disk_offload
                 and not self.use_thp
                 and parallel_config.data_parallel_size > 1
                 and not parallel_config.enable_elastic_ep
@@ -93,6 +107,8 @@ class EngramConfig:
 
     def verify_parallel_config(self, parallel_config: "ParallelConfig") -> None:
         """Reject unsupported embedding parallel topologies."""
+        if self.disk_offload and self.get_parallel_size(parallel_config) != 1:
+            raise ValueError("Engram disk_offload requires an embedding group of 1")
         if self.dp_shared_memory:
             if parallel_config.data_parallel_size <= 1:
                 raise ValueError("dp_shared_memory requires data_parallel_size > 1.")
