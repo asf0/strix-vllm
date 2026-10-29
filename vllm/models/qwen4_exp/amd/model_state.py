@@ -146,19 +146,23 @@ class Qwen4ExpModelState(MambaHybridModelState):
         num_reqs = input_batch.num_reqs
         if not num_reqs or input_batch.num_draft_tokens:
             return
-        ctx = self.ngram_context_len
         starts = input_batch.num_computed_prefill_tokens_np[:num_reqs]
         lens = input_batch.num_scheduled_tokens[:num_reqs]
-        spans = []
+        spans, next_spans = [], []
         for i, req_id in enumerate(input_batch.req_ids[:num_reqs]):
             tokens = self._host_prefill_tokens.get(req_id)
             start, length = int(starts[i]), int(lens[i])
             # Only steps whose every token is a known prefill token.
             if tokens is None or start + length > tokens.size:
                 return
-            context = tokens[max(0, start - ctx) : start]
-            pad = np.full(ctx - context.size, self.ngram_eos_token_id, dtype=np.int64)
-            spans.append(np.concatenate([pad, context, tokens[start : start + length]]))
+            spans.append(self._ngram_span(tokens, start, length))
+            # The request's next prompt chunk, assumed the same size, for the
+            # page-cache warm-up.
+            nxt = start + length
+            if nxt < tokens.size:
+                next_spans.append(
+                    self._ngram_span(tokens, nxt, min(length, tokens.size - nxt))
+                )
         if self._ple_hash_params is None:
             self._ple_hash_params = [
                 (
@@ -169,13 +173,25 @@ class Qwen4ExpModelState(MambaHybridModelState):
                 for owner, _ in self._disk_ple
             ]
         for (owner, embedding), params in zip(self._disk_ple, self._ple_hash_params):
-            ids = np.concatenate(
-                [
-                    self._host_ngram_ids(span, *params, owner.heads_per_ngram)
-                    for span in spans
-                ]
+            ids, next_ids = (
+                np.concatenate(
+                    [
+                        self._host_ngram_ids(span, *params, owner.heads_per_ngram)
+                        for span in group
+                    ]
+                )
+                if group
+                else None
+                for group in (spans, next_spans)
             )
-            embedding.prefetch_host_ids(ids)
+            embedding.prefetch_host_ids(ids, next_ids)
+
+    def _ngram_span(self, tokens: np.ndarray, start: int, length: int) -> np.ndarray:
+        """The EOS-padded n-gram context before `start`, then `length` tokens."""
+        ctx = self.ngram_context_len
+        context = tokens[max(0, start - ctx) : start]
+        pad = np.full(ctx - context.size, self.ngram_eos_token_id, dtype=np.int64)
+        return np.concatenate([pad, context, tokens[start : start + length]])
 
     def prepare_inputs(
         self,

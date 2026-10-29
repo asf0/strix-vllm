@@ -707,6 +707,7 @@ class Qwen4ExpPLEDiskEmbedding(Qwen4ExpPLEEmbedding):
         self._prefetch_slot = 0
         self._coordinator: ThreadPoolExecutor | None = None
         self._pending: tuple | None = None
+        self._warm_buffer: torch.Tensor | None = None
 
     def allocate_embedding_weight(
         self,
@@ -841,12 +842,26 @@ class Qwen4ExpPLEDiskEmbedding(Qwen4ExpPLEEmbedding):
         self._gather_rows(ids, staging)
         return time.perf_counter() - t0
 
-    def prefetch_host_ids(self, ids: np.ndarray) -> None:
+    def _warm_task(self, ids: torch.Tensor) -> None:
+        # Fault the rows into the page cache; the bytes themselves are dropped.
+        if self._warm_buffer is None or self._warm_buffer.shape[0] < ids.numel():
+            self._warm_buffer = torch.empty(
+                self._max_rows, self._staging.shape[1], dtype=torch.uint8
+            )
+        self._gather_rows(ids, self._warm_buffer[: ids.numel()])
+
+    def prefetch_host_ids(
+        self, ids: np.ndarray, next_ids: np.ndarray | None = None
+    ) -> None:
         """Start gathering the rows of host-computed n-gram ids [T, heads].
 
         The next forward with the same id shape uses these rows instead of
         copying its ids to the host, so the gather overlaps the GPU work queued
         before it instead of following a stream sync.
+
+        ``next_ids`` (the following prompt chunk's ids) are read into the page
+        cache after this step's gather, while the GPU runs this step: a chunk
+        whose rows are cached gathers in tens of ms instead of ~0.5 s cold.
         """
         if self._rows is None:
             self._map_table()
@@ -870,6 +885,10 @@ class Qwen4ExpPLEDiskEmbedding(Qwen4ExpPLEEmbedding):
         assert self._coordinator is not None
         future = self._coordinator.submit(self._prefetch_task, host_ids, staging, event)
         self._pending = (ids.shape, host_ids, future, staging, event)
+        if next_ids is not None and 0 < next_ids.size <= self._max_rows:
+            self._coordinator.submit(
+                self._warm_task, torch.from_numpy(next_ids.reshape(-1))
+            )
 
     def start_prefetch(self, ngram_ids: torch.Tensor) -> None:
         raise RuntimeError("Disk PLE embedding does not support prefetch")
