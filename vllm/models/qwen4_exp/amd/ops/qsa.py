@@ -18,6 +18,7 @@ _TOPK_WORKSPACE_BYTES = 1024 * 1024
 # Up to this many single-row decode requests, scoring row by row beats the
 # tiled kernel on gfx942. Measured against the tiled kernel on MI325X.
 _QSA_ROWS_KERNEL_MAX_ROWS = 32
+_BOUNDED_COLUMNS_MIN_ROWS = 1024
 
 
 def _on_rdna() -> bool:
@@ -1131,8 +1132,12 @@ def qsa_select_paged_tokens(
     compress_ratio: int,
     out: torch.Tensor | None = None,
     single_row_decode: bool = False,
+    max_seq_len: int | None = None,
 ) -> torch.Tensor:
-    """Score, select, and expand QSA indices without host synchronization."""
+    """Score, select, and expand QSA indices without host synchronization.
+
+    ``max_seq_len`` (the batch's longest request, host side) bounds the score
+    width for large batches; otherwise it spans the page table's capacity."""
     rows = q.shape[0]
     output_width = token_topk + compress_ratio - 1
     if out is None:
@@ -1143,6 +1148,13 @@ def qsa_select_paged_tokens(
         return out
 
     columns = page_table.shape[1] * k_cache.shape[1]
+    if max_seq_len is not None and rows >= _BOUNDED_COLUMNS_MIN_ROWS:
+        # No row sees more than max_seq_len // ratio compressed keys: at a
+        # 16k context that is 4096 of a 128k model's 32768 columns, which the
+        # scoring kernel would otherwise fill with -inf and top-k re-read.
+        # Large batches only: they never replay a CUDA graph, whose captured
+        # width must not change from step to step.
+        columns = min(columns, max(triton.cdiv(max_seq_len, compress_ratio), 1))
     block_topk = token_topk // compress_ratio
     rows_per_chunk = max(1, _LOGITS_WORKSPACE_BYTES // max(columns * 4, 1))
     chunk_rows = min(rows, rows_per_chunk)
@@ -1164,6 +1176,7 @@ def qsa_select_paged_tokens(
             sequence_lengths,
             compress_ratio,
             single_row_decode=single_row_decode,
+            num_columns=columns,
         )
         blocks = blocks_buffer[: row_end - row_start]
         use_cooperative_topk = (
