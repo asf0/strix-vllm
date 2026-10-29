@@ -444,6 +444,27 @@ def _hc_combine_norm(
     return out, y
 
 
+def _hc_up_gate_mix_unfused(
+    x: torch.Tensor, lowrank: torch.Tensor, weight: torch.Tensor, hc_count: int
+) -> torch.Tensor:
+    from vllm.model_executor.layers.utils import dispatch_unquantized_gemm
+
+    gate = dispatch_unquantized_gemm()(None, lowrank, weight)
+    return _hc_gate_mix(x, gate, hc_count)
+
+
+# hc_gate_mix(x, lowrank @ weight.T) behind one op, so a backend can fuse the
+# up projection into the mix and never write the [M, hc_count * H] gate. Out-of-
+# tree kernel plugins replace this module attribute; it is looked up per call.
+hc_up_gate_mix_impl = _hc_up_gate_mix_unfused
+
+
+def _hc_up_gate_mix(
+    x: torch.Tensor, lowrank: torch.Tensor, weight: torch.Tensor, hc_count: int
+) -> torch.Tensor:
+    return hc_up_gate_mix_impl(x, lowrank, weight, hc_count)
+
+
 def _same_shape_fake(x: torch.Tensor, *args) -> torch.Tensor:
     return x.new_empty(x.shape)
 
@@ -452,6 +473,13 @@ def _hc_gate_mix_fake(
     x: torch.Tensor, gate: torch.Tensor, hc_count: int
 ) -> torch.Tensor:
     del gate
+    return x.new_empty((x.shape[0], x.shape[1] // hc_count))
+
+
+def _hc_up_gate_mix_fake(
+    x: torch.Tensor, lowrank: torch.Tensor, weight: torch.Tensor, hc_count: int
+) -> torch.Tensor:
+    del lowrank, weight
     return x.new_empty((x.shape[0], x.shape[1] // hc_count))
 
 
@@ -493,6 +521,11 @@ direct_register_custom_op(
     fake_impl=_hc_gate_mix_fake,
 )
 direct_register_custom_op(
+    op_name="qwen4_exp_hc_up_gate_mix",
+    op_func=_hc_up_gate_mix,
+    fake_impl=_hc_up_gate_mix_fake,
+)
+direct_register_custom_op(
     op_name="qwen4_exp_hc_combine",
     op_func=_hc_combine,
     fake_impl=_hc_combine_fake,
@@ -516,6 +549,14 @@ def hc_silu(x: torch.Tensor, hc_count: int) -> torch.Tensor:
 
 def hc_gate_mix(x: torch.Tensor, gate: torch.Tensor, hc_count: int) -> torch.Tensor:
     return torch.ops.vllm.qwen4_exp_hc_gate_mix(x, gate, hc_count)
+
+
+def hc_up_gate_mix(
+    x: torch.Tensor, lowrank: torch.Tensor, weight: torch.Tensor, hc_count: int
+) -> torch.Tensor:
+    """hc_gate_mix(x, lowrank @ weight.T, hc_count) for an unquantized up
+    projection `weight` [hc_count * H, lowrank]."""
+    return torch.ops.vllm.qwen4_exp_hc_up_gate_mix(x, lowrank, weight, hc_count)
 
 
 def hc_combine(
@@ -553,4 +594,5 @@ __all__ = [
     "hc_combine_norm",
     "hc_gate_mix",
     "hc_silu",
+    "hc_up_gate_mix",
 ]
