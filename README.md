@@ -19,6 +19,65 @@ For events, please visit [vllm.ai/events](https://vllm.ai/events) to join us.
 
 ---
 
+## This fork: vLLM on AMD Strix Halo (gfx1151)
+
+This branch is upstream vLLM `main` plus a small set of commits for running Qwen3.8,
+Flint, LFM2.5 and Inkling 2 models on a 128 GB Strix Halo APU. The gfx1151 kernels
+themselves live out of tree in [libstrix](https://github.com/asf0/libstrix), a vLLM
+plugin. This branch carries only the changes that a plugin can't make:
+
+- **Hybrid KV pages.** When a speculative drafter's per-token KV page is not a near
+  multiple of the target's (int8 KV with per-head scales: 1040 and 2112 bytes on
+  Qwen3.6-35B-A3B), hybrid blocks are sized for the drafter instead of the lcm, so GDN
+  pages pay ~1.5% padding instead of 2x.
+- **GDN under speculative decoding** (`--use-replayssm`). One GatedDeltaNet state per
+  request instead of one per verification position: accepted tokens are replayed onto
+  the checkpoint, bitwise identical to the per-slot path, with about 470 MB less state
+  on Qwen3.8-27B at MTP k=2.
+- **Qwen3.8-Flash-Next.** The 102 GB engram n-gram table is streamed from disk
+  (`engram_config={"disk_offload": true}`), and the next chunk's rows are prefetched into
+  the page cache. The model also gets a gfx1151 prefill path, and the
+  hyper-connection up projection and QSA indexer are behind swappable ops for libstrix.
+  See [docs/features/engram.md](docs/features/engram.md#running-qwen38-flash-next-on-gfx1151-with-libstrix).
+- **Inkling 2.** Inkling 2 Small (upstream PR #67685) and Inkling 2 Mini (the looped
+  model) on ROCm and RDNA: NVFP4/MXFP8 experts without FP8 hardware, gfx1151 attention
+  launch shapes, DSpark drafting only the steps its batch-size schedule verifies, and
+  hooks where libstrix swaps in its HIP kernels (expert GEMMs, prefill attention with
+  in-kernel relative logits, the attention prologue's K/V convolutions). With libstrix,
+  Inkling 2 Mini prefills 2.6-2.7k tok/s from 2.7k to 21.5k tokens and decodes 47 tok/s
+  for one request (56 with DSpark), 94 / 155 tok/s total for 4 / 16; GSM8K 213-216 of 250.
+
+Qwen3.8-Flash-Next AWQ W4A16 with libstrix, single stream, 16k prefill chunks, MTP 2:
+
+| Prompt | Prefill tok/s | Decode tok/s |
+|---|---|---|
+| 5.6k | 1,539 | 43 |
+| 26.9k | 1,617 | 43 |
+| 100.5k | 1,572 | 40 |
+
+Before this work, the same setup reached 684 to 806 tok/s prefill and about 18 tok/s
+decode. Perplexity is 1.96 on wikitext-2.
+
+A ready-made image with this branch, libstrix and ROCm 10.1 for gfx1151, plus one
+compose recipe per tested model, is described in
+[libstrix's Docker section](https://github.com/asf0/libstrix#docker):
+
+```sh
+docker pull ghcr.io/asf0/strix-vllm:latest
+```
+
+### Branches
+
+- `dev`: upstream `main` plus the fork's commits, rebased onto upstream
+  regularly (its history may be rewritten).
+- `vX.Y.x`: release lines. Never rebased; they take fixes cherry-picked from
+  `dev`.
+- `strix/vX.Y.Z`: release tags. Immutable. The `strix/` prefix keeps them apart
+  from upstream vLLM's own `vX.Y.Z` tags.
+- `strix/sync-YYYY-MM-DD`: `dev` as it was before each upstream sync.
+
+---
+
 ## About
 
 vLLM is a fast and easy-to-use library for LLM inference and serving.
