@@ -109,9 +109,10 @@ the same pool as the weights and the KV cache:
 vllm serve <qwen4exp-checkpoint> --engram-config '{"disk_offload": true}'
 ```
 
-It applies only to Qwen4Exp on CUDA and takes precedence over `cpu_offload`.
+It applies to Qwen4Exp on CUDA, and on ROCm with tensor-parallel size 1
+(see [ROCm](#rocm)), and takes precedence over `cpu_offload`.
 
-Rows are read with `preadv` and copied to fixed device buffers before the
+On CUDA, rows are read with `preadv` and copied to fixed device buffers before the
 forward, so CUDA graphs replay unchanged. They stay in the checkpoint format
 (BF16, FP8 or NVFP4) and are decoded on the GPU, so an unquantized table must
 match `--dtype`. Rows that were read recently are served from the OS page
@@ -130,6 +131,57 @@ Costs and limits:
   not file-backed safetensors views (`.bin`, runai, `fastsafetensors`,
   `instanttensor`, or `--safetensors-load-strategy eager`);
   `--load-format dummy` serves zeros.
+
+### ROCm
+
+Some tables do not fit even in host memory. Qwen3.8-Flash-Next's n-gram table
+is 102.4 GB of BF16 rows alone (128 shards x 2,500,012 rows x 160 dims, 320 B
+per row), against 128 GB of unified memory on a Strix Halo APU. `disk_offload`
+on ROCm leaves the table in the checkpoint and reads the rows a step needs
+through a memory map:
+
+```bash
+vllm serve /path/to/Qwen3.8-Flash-Next-AWQ-W4A16 \
+    --engram-config '{"disk_offload": true}' --language-model-only
+```
+
+How it works:
+
+- The table file is mapped read-only (`MADV_RANDOM`, it is a hashed table, so
+  neighbours are useless) and the loader marks it as an unused checkpoint
+  weight, so the weights are never copied.
+- Each step's n-gram ids are hashed on the host, gathered from the map with 64
+  threads, and uploaded; the gather runs on a worker thread while the preceding
+  layers' GPU work executes, and the following prompt chunk's rows are read
+  into the page cache in the same window.
+- The lookup is a **splitting op**, so `FULL` CUDA graphs degrade to
+  `PIECEWISE`; do not force `FULL_AND_PIECEWISE`.
+
+Requirements and guidance:
+
+- AMD, tensor-parallel size 1.
+- Table shards must live in one checkpoint file and be row-aligned (checked at
+  load).
+- Leave page cache for the rows: on a 128 GB APU with a 68 GB checkpoint,
+  `--gpu-memory-utilization 0.80` measured ~10-20% more prefill throughput than
+  0.70, and 0.80 is the practical ceiling.
+- `VLLM_PLE_DISK_TIMING=1` logs per-lookup timings;
+  `VLLM_PLE_DISK_VERIFY=1` also compares host-computed ids against the GPU's
+  and reports out-of-range ids by name instead of failing inside the gather.
+
+#### Running Qwen3.8-Flash-Next on gfx1151 with libstrix
+
+The QSA and hyper-connection kernels need the [libstrix](https://github.com/asf0/libstrix)
+plugin on gfx1151; it installs as a `vllm.general_plugins`
+entry point, so `pip install -e .` in that checkout is enough (build its
+`_C.so` with `./build.sh` first, after sourcing the ROCm environment) and the
+log shows `libstrix: plugin registered`. Measured on a 128 GB Strix Halo
+(single stream, 16k prefill chunks): 1,420-1,660 tok/s prefill from 2k to
+128k tokens (about 2x without the plugin), 40-43 tok/s decode with MTP on real
+text, perplexity 1.96 on wikitext-2; each kernel
+can be switched off with `STRIX_DISABLE=<name>` except `gdn_conv`, which this
+model needs. The serve command and tuning notes are in libstrix's README
+(https://github.com/asf0/libstrix#qwen38-flash-next).
 
 ## Data-parallel topologies (DeepSeek V4.1)
 
