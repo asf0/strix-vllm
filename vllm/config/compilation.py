@@ -773,6 +773,8 @@ class CompilationConfig:
         "vllm::short_conv",
         # Qwen4Exp's AMD backend still uses these splitting ops.
         "vllm::qwen4_exp_ple_short_conv",
+        # Host-synchronizing lookup of a disk-offloaded PLE table.
+        "vllm::qwen4_exp_amd_ple_ngram_embedding_disk",
         "vllm::qwen4_exp_qsa_with_output",
         # The fused prepare calls this op instead of the one above.
         "vllm::qwen4_exp_qsa_prepare_with_output",

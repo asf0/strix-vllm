@@ -1,14 +1,24 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Shared Qwen4Exp n-gram embedding storage with device and pinned-host backends.
+"""Shared Qwen4Exp n-gram embedding storage with device, pinned-host and disk
+backends.
 
 Both the NVIDIA and AMD Qwen4Exp implementations use these classes so the (large)
 n-gram embedding table can be kept in pinned host memory and looked up through
-Unified Virtual Addressing on any CUDA-alike platform.
+Unified Virtual Addressing on any CUDA-alike platform, or left in the checkpoint
+and read through a memory map when it does not fit in host memory.
 """
 
+import glob
+import json
+import mmap
+import os
+import re
+import struct
 import threading
+import warnings
 from abc import ABC, abstractmethod
+from concurrent.futures import ThreadPoolExecutor
 from typing import ClassVar
 
 import torch
@@ -16,6 +26,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
+from vllm.config import get_current_vllm_config
 from vllm.distributed import get_dp_group, get_etp_group, get_tp_group
 from vllm.forward_context import DPMetadata, get_forward_context
 from vllm.logger import init_logger
@@ -587,6 +598,242 @@ class Qwen4ExpPLEDeviceEmbedding(Qwen4ExpPLEEmbedding):
             ngram_ids.shape[0],
             slot_offset,
         )
+
+
+_SAFETENSORS_DTYPES = {
+    "BF16": torch.bfloat16,
+    "F16": torch.float16,
+    "F32": torch.float32,
+    "F8_E4M3": torch.float8_e4m3fn,
+}
+_PLE_TABLE_SHARD_RE = re.compile(
+    r"(?:^|\.)layers\.(\d+)\.ple\.ple_embedding\.ngram_embedding"
+    r"\.shard_(\d+)\.weight$"
+)
+
+
+def is_ple_table_weight(name: str) -> bool:
+    """Whether a checkpoint tensor is a row shard of a PLE n-gram table."""
+    return _PLE_TABLE_SHARD_RE.search(name) is not None
+
+
+def _resolve_checkpoint_dir(model: str, revision: str | None) -> str:
+    if os.path.isdir(model):
+        return model
+    from huggingface_hub import try_to_load_from_cache
+
+    for filename in ("model.safetensors.index.json", "model.safetensors"):
+        path = try_to_load_from_cache(model, filename, revision=revision)
+        if isinstance(path, str):
+            return os.path.dirname(path)
+    raise FileNotFoundError(f"No local safetensors checkpoint found for {model}")
+
+
+def _read_safetensors_header(path: str) -> tuple[int, dict]:
+    """Return the file offset of the data section and the tensor header."""
+    with open(path, "rb") as f:
+        (header_len,) = struct.unpack("<Q", f.read(8))
+        header = json.loads(f.read(header_len))
+    header.pop("__metadata__", None)
+    return 8 + header_len, header
+
+
+class Qwen4ExpPLEDiskEmbedding(Qwen4ExpPLEEmbedding):
+    """PLE table left in the checkpoint and read through a read-only mmap.
+
+    Lookups copy the n-gram IDs to the host and gather rows there, so they
+    must run outside CUDA graphs. The page cache keeps hot rows in memory;
+    parallel gather threads keep several disk reads in flight.
+    """
+
+    _GATHER_THREADS: ClassVar[int] = 32
+    _MIN_ROWS_PER_TASK: ClassVar[int] = 64
+
+    def __init__(
+        self,
+        num_embeddings: int,
+        embedding_dim: int,
+        *,
+        params_dtype: torch.dtype,
+        padding_size: int,
+        prefix: str,
+        embedding_method: Qwen4ExpPLEEmbeddingMethod,
+        num_ngram_heads: int = 1,
+        max_total_tokens: int = 0,
+        data_parallel_rank: int = 0,
+        reduce_results: bool = True,
+    ) -> None:
+        super().__init__(
+            num_embeddings,
+            embedding_dim,
+            params_dtype=params_dtype,
+            padding_size=padding_size,
+            prefix=prefix,
+            embedding_method=embedding_method,
+            num_ngram_heads=num_ngram_heads,
+            max_total_tokens=max_total_tokens,
+            data_parallel_rank=data_parallel_rank,
+            reduce_results=reduce_results,
+        )
+        if self.tp_size != 1:
+            raise NotImplementedError("Disk-offloaded PLE tables require ETP=1")
+        layer_match = re.search(r"layers\.(\d+)\.", prefix)
+        if layer_match is None:
+            raise ValueError(f"No layer index in PLE embedding prefix {prefix!r}")
+        self._layer_idx = int(layer_match.group(1))
+        model_config = get_current_vllm_config().model_config
+        self._checkpoint = (model_config.model, model_config.revision)
+        self._max_rows = max_total_tokens * num_ngram_heads
+        self._table_map: mmap.mmap | None = None
+        self._rows: torch.Tensor | None = None
+        self._row_starts: torch.Tensor | None = None
+        self._shard_rows = 0
+        self._ids_host: torch.Tensor | None = None
+        self._staging: torch.Tensor | None = None
+        self._pool: ThreadPoolExecutor | None = None
+
+    def allocate_embedding_weight(
+        self,
+        num_embeddings: int,
+        embedding_dim: int,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Keep an empty weight that records the table dtype; rows stay on disk."""
+        return torch.empty(0, embedding_dim, dtype=dtype, device="cpu")
+
+    def _find_table_shards(self, checkpoint_dir: str) -> dict[int, tuple]:
+        index_path = os.path.join(checkpoint_dir, "model.safetensors.index.json")
+        if os.path.exists(index_path):
+            with open(index_path) as f:
+                weight_map = json.load(f)["weight_map"]
+            files = sorted(
+                os.path.join(checkpoint_dir, file)
+                for name, file in weight_map.items()
+                if is_ple_table_weight(name)
+            )
+        else:
+            files = sorted(glob.glob(os.path.join(checkpoint_dir, "*.safetensors")))
+        shards: dict[int, tuple] = {}
+        for path in dict.fromkeys(files):
+            data_start, header = _read_safetensors_header(path)
+            for name, info in header.items():
+                match = _PLE_TABLE_SHARD_RE.search(name)
+                if match is not None and int(match.group(1)) == self._layer_idx:
+                    shards[int(match.group(2))] = (path, data_start, info)
+        return shards
+
+    def _map_table(self) -> None:
+        """Map the checkpoint file and index its shards by first file row."""
+        checkpoint_dir = _resolve_checkpoint_dir(*self._checkpoint)
+        shards = self._find_table_shards(checkpoint_dir)
+        if not shards:
+            raise FileNotFoundError(
+                f"No PLE table shards for layer {self._layer_idx} in {checkpoint_dir}"
+            )
+        if sorted(shards) != list(range(len(shards))):
+            raise ValueError("PLE table shards are not numbered 0..n-1")
+        paths = {path for path, _, _ in shards.values()}
+        if len(paths) != 1:
+            raise NotImplementedError("PLE table shards span several files")
+
+        row_bytes = self.embedding_dim * self.weight.element_size()
+        shard_rows = shards[0][2]["shape"][0]
+        row_starts: list[int] = []
+        total_rows = 0
+        for index in range(len(shards)):
+            info = shards[index][2]
+            rows, dim = info["shape"]
+            if (
+                _SAFETENSORS_DTYPES.get(info["dtype"]) != self.weight.dtype
+                or dim != self.embedding_dim
+            ):
+                raise ValueError(
+                    f"PLE table shard {index} is {info['dtype']} {info['shape']}, "
+                    f"expected {self.weight.dtype} rows of {self.embedding_dim}"
+                )
+            if index < len(shards) - 1 and rows != shard_rows:
+                raise ValueError(f"PLE table shard {index} has {rows} rows")
+            begin = info["data_offsets"][0]
+            if begin % row_bytes:
+                raise ValueError(f"PLE table shard {index} is not row aligned")
+            row_starts.append(begin // row_bytes)
+            total_rows += rows
+        if total_rows != self.org_vocab_size:
+            raise ValueError(
+                f"PLE table has {total_rows} rows, expected {self.org_vocab_size}"
+            )
+
+        (path,) = paths
+        data_start = shards[0][1]
+        with open(path, "rb") as f:
+            self._table_map = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+        # Rows are hashed, so read-ahead would only fetch unused neighbors.
+        self._table_map.madvise(mmap.MADV_RANDOM)
+        with warnings.catch_warnings():
+            # The map is read-only; nothing writes through this tensor.
+            warnings.simplefilter("ignore", UserWarning)
+            file_bytes = torch.frombuffer(self._table_map, dtype=torch.uint8)
+        data = file_bytes[data_start:]
+        self._rows = data[: data.numel() // row_bytes * row_bytes].view(-1, row_bytes)
+        self._row_starts = torch.tensor(row_starts, dtype=torch.long)
+        self._shard_rows = shard_rows
+        self._ids_host = torch.empty(self._max_rows, dtype=torch.long, pin_memory=True)
+        self._staging = torch.empty(
+            self._max_rows, row_bytes, dtype=torch.uint8, pin_memory=True
+        )
+        self._pool = ThreadPoolExecutor(
+            self._GATHER_THREADS, thread_name_prefix="ple-disk"
+        )
+        logger.info(
+            "Mapped PLE table of layer %d from %s: %d rows of %d bytes",
+            self._layer_idx,
+            path,
+            total_rows,
+            row_bytes,
+        )
+
+    def _gather(self, file_rows: torch.Tensor, out: torch.Tensor) -> None:
+        # Inference mode is thread-local and the buffers are inference tensors.
+        with torch.inference_mode():
+            torch.index_select(self._rows, 0, file_rows, out=out)
+
+    def start_prefetch(self, ngram_ids: torch.Tensor) -> None:
+        raise RuntimeError("Disk PLE embedding does not support prefetch")
+
+    def finalize_prefetch(self, total_tokens: int) -> torch.Tensor:
+        raise RuntimeError("Disk PLE embedding does not support prefetch")
+
+    def forward(self, ngram_ids: torch.Tensor) -> torch.Tensor:
+        """Gather the rows for ``ngram_ids`` on the host and return them on device."""
+        if self._rows is None:
+            self._map_table()
+        assert self._pool is not None
+        assert self._ids_host is not None and self._staging is not None
+        num_rows = ngram_ids.numel()
+        if num_rows > self._max_rows:
+            raise ValueError(
+                f"PLE lookup of {num_rows} rows exceeds the {self._max_rows} budget"
+            )
+        ids = self._ids_host[:num_rows]
+        ids.copy_(ngram_ids.reshape(-1), non_blocking=True)
+        # Also orders this step's staging writes after the previous upload.
+        torch.cuda.current_stream().synchronize()
+        file_rows = self._row_starts[ids // self._shard_rows] + ids % self._shard_rows
+        staging = self._staging[:num_rows]
+        step = max(self._MIN_ROWS_PER_TASK, -(-num_rows // self._GATHER_THREADS))
+        tasks = [
+            self._pool.submit(
+                self._gather,
+                file_rows[start : start + step],
+                staging[start : start + step],
+            )
+            for start in range(step, num_rows, step)
+        ]
+        self._gather(file_rows[:step], staging[:step])
+        for task in tasks:
+            task.result()
+        rows = staging.view(self.weight.dtype).view(*ngram_ids.shape, -1)
+        return rows.to(ngram_ids.device, non_blocking=True)
 
 
 @triton.jit
