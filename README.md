@@ -52,6 +52,14 @@ Qwen3.8-Flash-Next AWQ W4A16 with libstrix, single stream, 16k prefill chunks, M
 Before this work, the same setup reached 684 to 806 tok/s prefill and about 18 tok/s
 decode. Perplexity is 1.96 on wikitext-2.
 
+A ready-made image with this branch, libstrix and ROCm 10.1 for gfx1151, plus one
+compose recipe per tested model, is described in
+[libstrix's Docker section](https://github.com/asf0/libstrix#docker):
+
+```sh
+docker pull ghcr.io/asf0/strix-vllm:latest
+```
+
 ---
 
 ## About
