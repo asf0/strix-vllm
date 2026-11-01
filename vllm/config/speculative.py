@@ -813,6 +813,19 @@ class SpeculativeConfig:
             # Qwen3 DSpark drafts reuse the DeepSeek-V4 DSpark architecture name.
             hf_config.update({"architectures": ["Qwen3DSparkModel"]})
             return hf_config
+        if (
+            initial_architecture == "Lfm2DSparkDraftModel"
+            and hf_config.model_type == "qwen3"
+        ):
+            # LFM2 DSpark drafts (SGLang's Lfm2DSparkDraftModel) are Qwen3-style
+            # DSpark drafts whose confidence head reads the Markov embedding by
+            # default (SGLang: markov_rank > 0) and whose config does not say so.
+            if getattr(hf_config, "confidence_head_with_markov", None) is None:
+                hf_config.confidence_head_with_markov = (
+                    getattr(hf_config, "markov_rank", 0) or 0
+                ) > 0
+            hf_config.update({"architectures": ["Qwen3DSparkModel"]})
+            return hf_config
         if initial_architecture == "DFlash2DraftModel" and getattr(
             hf_config, "no_rope_layers", None
         ):

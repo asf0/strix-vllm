@@ -43,9 +43,11 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 from vllm.sequence import IntermediateTensors
 
 from .interfaces import (
+    EagleModelMixin,
     HasInnerState,
     IsHybrid,
     MixtureOfExperts,
+    SupportsEagle3,
     SupportsLoRA,
     SupportsPP,
     SupportsQuant,
@@ -390,7 +392,7 @@ class Lfm2MoeShortConvDecoderLayer(nn.Module):
 
 
 @support_torch_compile
-class Lfm2MoeModel(nn.Module):
+class Lfm2MoeModel(nn.Module, EagleModelMixin):
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_substr={
             ".conv.": ".short_conv.",
@@ -479,17 +481,32 @@ class Lfm2MoeModel(nn.Module):
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
 
-        for layer in islice(self.layers, self.start_layer, self.end_layer):
+        # Speculative drafts (DSpark) read the residual stream after the
+        # layers named in aux_hidden_state_layers.
+        aux_hidden_states: list[torch.Tensor] = []
+        if get_pp_group().is_first_rank:
+            self._maybe_add_hidden_state(
+                aux_hidden_states, self.start_layer, hidden_states, residual
+            )
+        for idx, layer in enumerate(
+            islice(self.layers, self.start_layer, self.end_layer),
+            start=self.start_layer,
+        ):
             hidden_states, residual = layer(
                 positions=positions,
                 hidden_states=hidden_states,
                 residual=residual,
+            )
+            self._maybe_add_hidden_state(
+                aux_hidden_states, idx + 1, hidden_states, residual
             )
         if not get_pp_group().is_last_rank:
             return IntermediateTensors(
                 {"hidden_states": hidden_states, "residual": residual}
             )
         hidden_states, _ = self.embedding_norm(hidden_states, residual)
+        if aux_hidden_states:
+            return hidden_states, aux_hidden_states
         return hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
@@ -505,6 +522,7 @@ class Lfm2MoeForCausalLM(
     IsHybrid,
     SupportsQuant,
     MixtureOfExperts,
+    SupportsEagle3,
 ):
     packed_modules_mapping = {
         "qkv_proj": [
@@ -564,6 +582,9 @@ class Lfm2MoeForCausalLM(
             tp_world_size=parallel_config.tensor_parallel_size,
             intermediate_size=hf_config.hidden_size,
             conv_kernel=hf_config.conv_L_cache,
+            # Speculative decoding keeps num_spec extra conv columns (as
+            # ShortConv.get_state_shape does); the page size must count them.
+            num_spec=vllm_config.num_speculative_tokens,
         )
 
     @classmethod
