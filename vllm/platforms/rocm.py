@@ -648,6 +648,7 @@ class RocmPlatform(Platform):
         "gptq",
         "auto_gptq",
         "fp8",
+        "dgpp_mixed",
         "deepseek_v4_fp8",
         "compressed-tensors",
         "fbgemm_fp8",
