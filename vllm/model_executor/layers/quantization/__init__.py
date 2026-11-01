@@ -17,6 +17,7 @@ QuantizationMethods = Literal[
     "auto_awq",
     "fp8",
     "w4afp8",
+    "dgpp_mixed",
     "fbgemm_fp8",
     "modelopt",
     "modelopt_fp4",
@@ -137,6 +138,7 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
     from .compressed_tensors.compressed_tensors import (
         CompressedTensorsConfig,
     )
+    from .dgpp_mixed import DgppMixedConfig
     from .experts_int8 import ExpertsInt8Config
     from .fbgemm_fp8 import FBGEMMFp8Config
     from .fp8 import Fp8Config
@@ -160,6 +162,7 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
         "auto_awq": AutoAWQConfig,
         "fp8": Fp8Config,
         "w4afp8": W4AFP8Config,
+        "dgpp_mixed": DgppMixedConfig,
         "fbgemm_fp8": FBGEMMFp8Config,
         "modelopt": ModelOptFp8Config,
         "modelopt_fp4": ModelOptNvFp4Config,
