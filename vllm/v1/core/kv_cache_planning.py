@@ -368,6 +368,14 @@ def _get_kv_cache_groups_uniform_type(
     return [KVCacheGroupSpec(list(spec.kv_cache_specs.keys()), spec)]
 
 
+def _is_draft_attention_spec(spec: KVCacheSpec) -> bool:
+    """A speculator's attention layer (MTP full attention or a DFlash
+    drafter's sliding window), which the planner keeps in its own group."""
+    return isinstance(spec, (FullAttentionSpec, SlidingWindowSpec)) and getattr(
+        spec, "is_draft_kv_cache", False
+    )
+
+
 def unify_kv_cache_spec_page_size(
     kv_cache_spec: dict[str, KVCacheSpec],
 ) -> dict[str, KVCacheSpec]:
@@ -396,6 +404,18 @@ def unify_kv_cache_spec_page_size(
     if len(page_sizes) <= 1:
         # All layers have the same page size, no need to unify.
         return kv_cache_spec
+
+    # Drafter layers get their own physical pool (see
+    # _get_kv_cache_groups_uniform_page_size), so they are unified among
+    # themselves: a drafter with a wider page (e.g. 8 KV heads next to a
+    # 2-head target) must not pad every target and Mamba page up to its size.
+    draft = {k: v for k, v in kv_cache_spec.items() if _is_draft_attention_spec(v)}
+    if draft and len(draft) < len(kv_cache_spec):
+        main = {k: v for k, v in kv_cache_spec.items() if k not in draft}
+        return {
+            **unify_kv_cache_spec_page_size(main),
+            **unify_kv_cache_spec_page_size(draft),
+        }
 
     max_page_size = max(page_sizes)
     new_kv_cache_spec = {}
@@ -548,10 +568,7 @@ def _get_kv_cache_groups_uniform_page_size(
         # Drafter buckets (all layers marked is_draft_kv_cache) are emitted
         # whole: they hold few layers by construction and must not drag the
         # group-size heuristic down to their count.
-        return bool(specs) and all(
-            isinstance(spec, FullAttentionSpec) and spec.is_draft_kv_cache
-            for spec in specs
-        )
+        return bool(specs) and all(_is_draft_attention_spec(spec) for spec in specs)
 
     non_draft_buckets = [
         (layers, specs)
@@ -603,7 +620,11 @@ def _get_kv_cache_groups_uniform_page_size(
             grouped_layers.append(layers[i::num_groups])
     groups = create_kv_cache_group_specs(kv_cache_spec, grouped_layers)
     for group, layer_names in zip(groups, grouped_layers):
-        if len(layer_names) == group_size or not layer_names:
+        is_draft_group = bool(layer_names) and all(
+            _is_draft_attention_spec(spec)
+            for spec in iter_layer_specs(group.kv_cache_spec)
+        )
+        if (len(layer_names) == group_size and not is_draft_group) or not layer_names:
             continue
         first_page = _get_per_layer_spec(group, layer_names[0]).page_size_bytes
         assert all(
@@ -612,12 +633,7 @@ def _get_kv_cache_groups_uniform_page_size(
         )
         # A drafter group keeps its own width, so it gets a narrow physical
         # pool instead of overlaying full-width blocks it barely uses.
-        group_layers = group_size
-        if all(
-            isinstance(spec, FullAttentionSpec) and spec.is_draft_kv_cache
-            for spec in iter_layer_specs(group.kv_cache_spec)
-        ):
-            group_layers = len(layer_names)
+        group_layers = len(layer_names) if is_draft_group else group_size
         group.physical_bytes_per_block = group_layers * first_page
     return groups
 
@@ -1264,8 +1280,7 @@ def _get_packed_kv_cache_groups(
         # whole: they hold few layers by construction and must not participate
         # in the repeat-pattern split.
         is_draft = all(
-            isinstance(s, FullAttentionSpec) and s.is_draft_kv_cache
-            for s in uniform_spec.kv_cache_specs.values()
+            _is_draft_attention_spec(s) for s in uniform_spec.kv_cache_specs.values()
         )
         bucketed.append((uniform_spec, page_size_layers, balanced, is_draft))
 
@@ -2093,7 +2108,10 @@ class DefaultKVCacheConfigBuilder(KVCacheConfigBuilder):
                     vllm_config.cache_config.prefix_cache_retention_interval
                 ),
             )
-        bytes_per_block = _pool_bytes_per_block(vllm_config, kv_cache_groups)
+        # Invert the divisor get_kv_cache_configs used: with fixed-width pools
+        # one block ID spans a block of every pool, so the widths add up
+        # (the widest pool alone would leave the others' share unallocated).
+        bytes_per_block = _null_block_bytes(vllm_config, kv_cache_groups)
         return get_kv_cache_config_from_groups(
             vllm_config, kv_cache_groups, num_blocks * bytes_per_block
         )

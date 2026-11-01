@@ -935,6 +935,10 @@ class SlidingWindowSpec(AttentionSpec):
     # re-prefill the last num_spec_prefill_tokens - 1 tokens from the end
     # of the sequence, and thus needs to delay freeing/caching of blocks.
     extra_retained_tokens: int = 0
+    # Speculator layers (e.g. a DFlash drafter's sliding-window attention):
+    # the planner gives them their own group and physical pool, sized at their
+    # own page, so they neither pad the target's pages nor shrink its groups.
+    is_draft_kv_cache: bool = False
 
     @property
     def num_retained_tokens(self) -> int:
@@ -989,6 +993,7 @@ class SlidingWindowSpec(AttentionSpec):
         return all(
             isinstance(spec, SlidingWindowSpec)
             and spec.sliding_window == self.sliding_window
+            and spec.is_draft_kv_cache == self.is_draft_kv_cache
             for spec in kv_cache_specs.values()
         )
 

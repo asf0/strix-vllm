@@ -243,6 +243,8 @@ class DFlashQwen3Attention(nn.Module):
             attn_type=attn_type,
             sinks=self.attention_sink_bias,
         )
+        # Drafter KV: its own cache group and pool (see kv_cache_planning).
+        self.attn.is_draft_kv_cache = True
         self.causal = causal
         if current_platform.is_rocm():
             from vllm.platforms.rocm import on_gfx1x

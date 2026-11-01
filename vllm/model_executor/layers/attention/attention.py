@@ -674,6 +674,7 @@ class Attention(nn.Module, AttentionLayerBase):
                 kv_quant_mode=quant_mode,
                 sliding_window=self.sliding_window,
                 page_size_padded=shared_page,
+                is_draft_kv_cache=getattr(self, "is_draft_kv_cache", False),
             )
         else:
             return FullAttentionSpec(
