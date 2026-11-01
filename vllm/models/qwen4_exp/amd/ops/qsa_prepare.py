@@ -140,6 +140,47 @@ def _store_rotated(dst, y, o1, o2, scale):
     tl.store(dst + HALF + rot, _to_dst_dtype(o2, dst, scale))
 
 
+@triton.jit
+def _quant_i8(x, inv_scale):
+    """Round like int8_per_token_head in vLLM: half away from zero, clamped."""
+    q = x * inv_scale
+    q = tl.where(q >= 0, q + 0.5, q - 0.5)
+    return tl.clamp(q, -128.0, 127.0).to(tl.int8)
+
+
+@triton.jit
+def _store_rotated_i8(dst, y, o1, o2):
+    """int8_per_token_head store of a rotated head: the bf16-rounded values
+    (what the unfused path writes) quantized with one absmax scale, stored as
+    fp32 right after the head's D bytes. Returns nothing; dst is int8."""
+    HALF: tl.constexpr = o1.shape[0]
+    D: tl.constexpr = y.shape[0]
+    dims = tl.arange(0, D)
+    rot = tl.arange(0, HALF)
+    y = y.to(tl.bfloat16).to(tl.float32)
+    o1 = o1.to(tl.bfloat16).to(tl.float32)
+    o2 = o2.to(tl.bfloat16).to(tl.float32)
+    tail = tl.where(dims >= 2 * HALF, tl.abs(y), 0.0)
+    amax = tl.maximum(tl.max(tail, axis=0), tl.max(tl.abs(o1), axis=0))
+    amax = tl.maximum(amax, tl.max(tl.abs(o2), axis=0))
+    scale = tl.maximum(amax / 127.0, 1e-6)
+    inv = 1.0 / scale
+    tl.store(dst + dims, _quant_i8(y, inv), mask=dims >= 2 * HALF)
+    tl.store(dst + rot, _quant_i8(o1, inv))
+    tl.store(dst + HALF + rot, _quant_i8(o2, inv))
+    tl.store((dst + D).to(tl.pointer_type(tl.float32)), scale)
+
+
+@triton.jit
+def _store_i8(dst, x):
+    D: tl.constexpr = x.shape[0]
+    dims = tl.arange(0, D)
+    x = x.to(tl.float32)
+    scale = tl.maximum(tl.max(tl.abs(x), axis=0) / 127.0, 1e-6)
+    tl.store(dst + dims, _quant_i8(x, 1.0 / scale))
+    tl.store((dst + D).to(tl.pointer_type(tl.float32)), scale)
+
+
 @triton.jit(
     do_not_specialize=[
         "num_tokens",
@@ -209,6 +250,7 @@ def _qsa_prepare_kernel(
     MAIN_HK: tl.constexpr,
     MAIN_D: tl.constexpr,
     MAIN_PAGE_SIZE: tl.constexpr,
+    MAIN_KV_INT8: tl.constexpr = False,
 ):
     pid = tl.program_id(0)
     num_index_work = num_k_work + tl.cdiv(num_tokens, TILE_T_Q) * tl.cdiv(HQ, TILE_H_Q)
@@ -263,9 +305,14 @@ def _qsa_prepare_kernel(
                     + (slot % MAIN_PAGE_SIZE) * main_cache_stride_token
                     + kv_head * main_cache_stride_head
                 )
-                _store_rotated(dst, y, o1, o2, main_k_scale)
                 v = tl.load(src + MAIN_HK * MAIN_D + dims)
-                tl.store(dst + MAIN_D + dims, _to_dst_dtype(v, dst, main_v_scale))
+                if MAIN_KV_INT8:
+                    # [K | K scale | V | V scale], 4-byte scales.
+                    _store_rotated_i8(dst, y, o1, o2)
+                    _store_i8(dst + MAIN_D + 4, v)
+                else:
+                    _store_rotated(dst, y, o1, o2, main_k_scale)
+                    tl.store(dst + MAIN_D + dims, _to_dst_dtype(v, dst, main_v_scale))
         else:
             out = (token * MAIN_HQ + head) * MAIN_D
             _store_rotated(main_q_out_ptr + out, y, o1, o2, None)
@@ -585,7 +632,9 @@ def qsa_prepare(
     caller-owned buffer, e.g. one that outlives an opaque custom op.
     """
     num_tokens = q.shape[0]
-    main_head_dim = main_kv_cache.shape[-1] // 2
+    # int8_per_token_head adds one fp32 scale after each of K and V.
+    main_kv_int8 = main_kv_cache.dtype == torch.int8
+    main_head_dim = (main_kv_cache.shape[-1] - (8 if main_kv_int8 else 0)) // 2
     num_main_kv_heads = main_kv_cache.shape[2]
     num_main_q_heads = main_qkv.shape[1] // (2 * main_head_dim) - num_main_kv_heads
     main_q_out = main_qkv.new_empty(num_tokens, num_main_q_heads, main_head_dim)
@@ -695,6 +744,7 @@ def qsa_prepare(
         MAIN_HK=num_main_kv_heads,
         MAIN_D=main_head_dim,
         MAIN_PAGE_SIZE=main_kv_cache.shape[1],
+        MAIN_KV_INT8=main_kv_int8,
         num_warps=1,
     )
     return main_q_out, main_gate_out

@@ -77,15 +77,16 @@ def assert_fp8_within_one_ulp(actual: torch.Tensor, expected: torch.Tensor) -> N
     assert bool(((code_diff <= 1) | (abs_diff <= 2**-8)).all())
 
 
-def _make_main_inputs(num_tokens: int) -> dict:
-    """Random main-attention arguments with a paged BF16 cache in vLLM's layout."""
+def _make_main_inputs(num_tokens: int, int8: bool = False) -> dict:
+    """Random main-attention arguments with a paged cache in vLLM's layout:
+    BF16, or int8_per_token_head (an fp32 scale after each of K and V)."""
     num_blocks = num_tokens // MAIN_PAGE + 2
     cache = torch.zeros(
         num_blocks,
         MAIN_HK,
         MAIN_PAGE,
-        2 * MAIN_D,
-        dtype=torch.bfloat16,
+        2 * MAIN_D + (8 if int8 else 0),
+        dtype=torch.int8 if int8 else torch.bfloat16,
         device="cuda",
     ).transpose(1, 2)
     slots = torch.randperm(num_blocks * MAIN_PAGE, device="cuda")[:num_tokens]
@@ -129,6 +130,11 @@ def _check_main_outputs(main: dict, q_out, gate_out, rope, positions) -> None:
     ).view(num_tokens, -1)
     q, k = rope(positions, q, k)
     kv_cache = main["main_kv_cache"]
+    torch.testing.assert_close(q_out.flatten(1), q, rtol=RTOL, atol=ATOL)
+    assert torch.equal(gate_out, gate)
+    if kv_cache.dtype == torch.int8:
+        _check_int8_cache(main, k, v)
+        return
     cache = torch.zeros_like(kv_cache)
     key_cache, value_cache = cache.split(MAIN_D, dim=-1)
     scale = torch.tensor(1.0, device="cuda")
@@ -142,14 +148,48 @@ def _check_main_outputs(main: dict, q_out, gate_out, rope, positions) -> None:
         scale,
         scale,
     )
-    torch.testing.assert_close(q_out.flatten(1), q, rtol=RTOL, atol=ATOL)
-    assert torch.equal(gate_out, gate)
     torch.testing.assert_close(kv_cache, cache, rtol=RTOL, atol=ATOL)
+
+
+def _check_int8_cache(main: dict, k: torch.Tensor, v: torch.Tensor) -> None:
+    """The fused int8 write against vLLM's unfused int8_per_token_head writer
+    on the reference K/V. K comes from a bf16 RoPE on one side and an fp32
+    one on the other, so the K bytes may land a step apart."""
+    from vllm.models.qwen4_exp.amd.ops.qsa import split_qsa_kv_cache
+    from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
+        triton_reshape_and_cache_flash_per_token_head_quant,
+    )
+    from vllm.v1.kv_cache_interface import KVQuantMode
+
+    actual = main["main_kv_cache"].transpose(1, 2)  # logical [B, H, N, content]
+    expected = torch.zeros_like(actual)
+    ek, ev, eks, evs = split_qsa_kv_cache(expected, MAIN_D)
+    triton_reshape_and_cache_flash_per_token_head_quant(
+        k.view(-1, MAIN_HK, MAIN_D),
+        v.view(-1, MAIN_HK, MAIN_D),
+        ek,
+        ev,
+        eks,
+        evs,
+        main["main_slot_mapping"],
+        KVQuantMode.INT8_PER_TOKEN_HEAD,
+    )
+    ak, av, aks, avs = split_qsa_kv_cache(actual, MAIN_D)
+    assert torch.equal(av, ev) and torch.equal(avs, evs)
+    # Compare what the bytes mean: rounding on each side is up to half a step,
+    # and the two RoPEs themselves differ by up to about a step here (0.015
+    # on one element of the 4,097-token case, which the bf16 check flags).
+    actual_k = ak.float() * aks[..., None]
+    expected_k = ek.float() * eks[..., None]
+    step = torch.maximum(aks, eks)[..., None]
+    assert ((actual_k - expected_k).abs() <= 2 * step).all()
+    torch.testing.assert_close(aks, eks, rtol=RTOL, atol=1e-6)
 
 
 @requires_qsa_kernels
 @pytest.mark.usefixtures("default_vllm_config")
 @pytest.mark.parametrize("indexer_dtype", [torch.bfloat16, torch.float8_e4m3fn])
+@pytest.mark.parametrize("main_int8", [False, True], ids=["main-bf16", "main-int8"])
 @pytest.mark.parametrize(
     "mrope,is_2d_positions,cache_rope_positions,state_size,seq_lens,query_lens,history_lens",
     [
@@ -174,6 +214,7 @@ def _check_main_outputs(main: dict, q_out, gate_out, rope, positions) -> None:
 )
 def test_qsa_fused_prepare_matches_unfused(
     indexer_dtype,
+    main_int8,
     mrope,
     is_2d_positions,
     cache_rope_positions,
@@ -338,7 +379,7 @@ def test_qsa_fused_prepare_matches_unfused(
     k_weight = torch.randn(D, dtype=torch.bfloat16, device=device) * 0.2
 
     fused_query = torch.empty(num_tokens, HQ, D, dtype=indexer_dtype, device=device)
-    main = _make_main_inputs(num_tokens)
+    main = _make_main_inputs(num_tokens, int8=main_int8)
     main_q_out, main_gate_out = qsa_prepare(
         projected_qk[:, : HQ * D],
         projected_qk[:, HQ * D :],

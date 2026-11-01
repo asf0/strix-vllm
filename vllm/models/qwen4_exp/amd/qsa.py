@@ -45,7 +45,11 @@ from vllm.v1.attention.backends.flash_attn import (
     FlashAttentionMetadata,
     FlashAttentionMetadataBuilder,
 )
+from vllm.v1.attention.backends.triton_attn import TritonAttentionBackend
 from vllm.v1.attention.ops import rocm_octave
+from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
+    triton_reshape_and_cache_flash_per_token_head_quant,
+)
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     FullAttentionSpec,
@@ -60,7 +64,7 @@ from vllm.v1.worker.workspace import (
 from ..common.qsa_cache import QSAForwardMetadata
 from . import model
 from .indexer_qsa import QSAIndexer
-
+from .ops.qsa import split_qsa_kv_cache
 
 def _octave_mid_o_capacity(vllm_config: VllmConfig) -> int:
     """Query rows times splits the Octave split-KV partials hold: every split
@@ -111,7 +115,12 @@ _OCTAVE_CACHE_DTYPES: tuple[CacheDType, ...] = (
     "octave_k3v3",
     "octave_k3v3_compact",
 )
-_QSA_CACHE_DTYPES: tuple[CacheDType, ...] = ("auto", "bfloat16", *_OCTAVE_CACHE_DTYPES)
+_QSA_CACHE_DTYPES: tuple[CacheDType, ...] = (
+    "auto",
+    "bfloat16",
+    "int8_per_token_head",
+    *_OCTAVE_CACHE_DTYPES,
+)
 
 
 class Qwen4ExpQSAFlashAttentionBackend(FlashAttentionBackend):
@@ -131,7 +140,11 @@ class Qwen4ExpQSAFlashAttentionBackend(FlashAttentionBackend):
             RocmOctaveAttentionBackend,
         )
 
-        return RocmOctaveAttentionBackend.customize_spec(spec)
+        # Octave packs its own slot; int8_per_token_head uses Triton's layout
+        # with inline fp32 scales. Each leaves other modes unchanged.
+        return TritonAttentionBackend.customize_spec(
+            RocmOctaveAttentionBackend.customize_spec(spec)
+        )
 
     @staticmethod
     def get_name() -> str:
@@ -166,14 +179,25 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
     supports_pcp: bool = False
 
     def __init__(self, *args, **kwargs) -> None:
+        # QSA runs its own kernels, never FlashAttention's, so FlashAttention's
+        # check for quantized caches does not apply: construct it as bf16,
+        # then keep the real cache dtype (int8_per_token_head).
+        args = list(args)
+        if len(args) > 6:
+            kv_cache_dtype, args[6] = args[6], "auto"
+        else:
+            kv_cache_dtype = kwargs.get("kv_cache_dtype", "auto")
+            kwargs["kv_cache_dtype"] = "auto"
         super().__init__(*args, **kwargs)
+        self.kv_cache_dtype = kv_cache_dtype
         if self.dcp_world_size != 1:
             raise NotImplementedError(
                 "Qwen4Exp QSA does not support decode context parallelism"
             )
         if self.kv_cache_dtype not in _QSA_CACHE_DTYPES:
             raise NotImplementedError(
-                "Qwen4Exp QSA requires a BF16 or Octave main KV cache"
+                "Qwen4Exp QSA requires a BF16, int8_per_token_head or Octave "
+                "main KV cache"
             )
         self.supports_quant_query_input = False
         self.octave_fmt: rocm_octave.OctaveFormat | None = None
@@ -243,7 +267,22 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
         slot_mapping: torch.Tensor,
     ) -> None:
         if self.octave_fmt is None:
-            super().do_kv_cache_update(layer, key, value, kv_cache, slot_mapping)
+            if kv_cache.dtype != torch.int8:
+                super().do_kv_cache_update(layer, key, value, kv_cache, slot_mapping)
+                return
+            key_cache, value_cache, k_scale, v_scale = split_qsa_kv_cache(
+                kv_cache, self.head_size
+            )
+            triton_reshape_and_cache_flash_per_token_head_quant(
+                key,
+                value,
+                key_cache,
+                value_cache,
+                k_scale,
+                v_scale,
+                slot_mapping,
+                get_kv_quant_mode(self.kv_cache_dtype),
+            )
             return
         n = slot_mapping.shape[0]
         if n == 0:
@@ -326,11 +365,18 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
                 self._stags,
             )
             return output
-        key_cache, value_cache = kv_cache.transpose(1, 2).split(self.head_size, dim=-1)
+        key_cache, value_cache, k_scale, v_scale = split_qsa_kv_cache(
+            kv_cache, self.head_size
+        )
         key_cache = canonicalize_singleton_dim_strides(key_cache)
         value_cache = canonicalize_singleton_dim_strides(value_cache)
-        if key_cache.dtype != torch.bfloat16 or query.dtype != torch.bfloat16:
-            raise NotImplementedError("Qwen4Exp QSA requires BF16 Q/K/V")
+        if query.dtype != torch.bfloat16 or key_cache.dtype not in (
+            torch.bfloat16,
+            torch.int8,
+        ):
+            raise NotImplementedError(
+                "Qwen4Exp QSA requires BF16 Q and BF16 or int8 K/V"
+            )
 
         from .ops.qsa import qsa_sparse_paged_attention
 
@@ -342,6 +388,7 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
             attn_metadata.block_table,
             token_to_req,
             output[:num_tokens],
+            **({} if k_scale is None else {"k_scale": k_scale, "v_scale": v_scale}),
         )
         return output
 
@@ -370,7 +417,8 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             raise NotImplementedError("Qwen4Exp QSA currently requires BF16")
         if cache_config.cache_dtype not in _QSA_CACHE_DTYPES:
             raise NotImplementedError(
-                "Qwen4Exp QSA requires a BF16 or Octave main KV cache"
+                "Qwen4Exp QSA requires a BF16, int8_per_token_head or Octave "
+                "main KV cache"
             )
         if getattr(quant_config, "kv_cache_scheme", None) is not None:
             raise NotImplementedError("Qwen4Exp QSA does not support KV quantization")
@@ -453,11 +501,12 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         self.kv_cache_torch_dtype = kv_cache_dtype_str_to_dtype(
             self.kv_cache_dtype, model_config
         )
-        if (
-            self.kv_cache_dtype not in _OCTAVE_CACHE_DTYPES
-            and self.kv_cache_torch_dtype != torch.bfloat16
+        if self.kv_cache_dtype not in _OCTAVE_CACHE_DTYPES and (
+            self.kv_cache_torch_dtype not in (torch.bfloat16, torch.int8)
         ):
-            raise NotImplementedError("Qwen4Exp QSA requires BF16 cache storage")
+            raise NotImplementedError(
+                "Qwen4Exp QSA requires BF16, int8 or Octave cache storage"
+            )
         self.kv_sharing_target_layer_name = None
         self.kv_cache = torch.tensor([])
         set_default_quant_scales(self, register_buffer=True)

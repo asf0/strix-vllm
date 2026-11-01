@@ -491,3 +491,110 @@ def test_qsa_sparse_paged_attention_matches_reference(
     )
 
     torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+
+
+@requires_qsa_kernels
+@pytest.mark.parametrize(
+    ("num_rows", "num_query_heads", "num_kv_heads", "page_size"),
+    [
+        pytest.param(1, 24, 2, 64, id="decode_split"),
+        pytest.param(16, 24, 2, 64, id="rows16"),
+        pytest.param(600, 24, 2, 64, id="prefill_rdna_tile"),
+    ],
+)
+def test_qsa_sparse_paged_attention_int8_cache(
+    num_rows: int,
+    num_query_heads: int,
+    num_kv_heads: int,
+    page_size: int,
+) -> None:
+    """int8_per_token_head cache, written by vLLM's quantizing cache write,
+    against the reference on the exact (fp32) dequantized K/V: only the
+    kernel differs. A bf16 copy of the dequantized K/V would round more than
+    the kernel does (it scales the exact int8 dot product in fp32)."""
+    from vllm.models.qwen4_exp.amd.ops.qsa import split_qsa_kv_cache
+    from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
+        triton_reshape_and_cache_flash_per_token_head_quant,
+    )
+    from vllm.v1.kv_cache_interface import KVQuantMode
+
+    torch.manual_seed(3)
+    head_dim = 256
+    num_blocks = 40
+    tokens = num_blocks * page_size
+    # Packed logical cache [blocks, kv_heads, page, K | ks | V | vs].
+    packed = torch.zeros(
+        num_blocks,
+        num_kv_heads,
+        page_size,
+        2 * head_dim + 8,
+        device="cuda",
+        dtype=torch.int8,
+    )
+    k_cache, v_cache, k_scale, v_scale = split_qsa_kv_cache(packed, head_dim)
+    # Per-token magnitudes spread over 20x so the scales matter.
+    spread = torch.logspace(-1, 0.3, tokens, device="cuda")[torch.randperm(tokens)]
+    keys = (
+        torch.randn(tokens, num_kv_heads, head_dim, device="cuda")
+        * spread[:, None, None]
+    )
+    values = (
+        torch.randn(tokens, num_kv_heads, head_dim, device="cuda")
+        * spread[:, None, None]
+    )
+    triton_reshape_and_cache_flash_per_token_head_quant(
+        keys.bfloat16(),
+        values.bfloat16(),
+        k_cache,
+        v_cache,
+        k_scale,
+        v_scale,
+        torch.arange(tokens, device="cuda"),
+        KVQuantMode.INT8_PER_TOKEN_HEAD,
+    )
+    k_deq = k_cache.float() * k_scale[..., None]
+    v_deq = v_cache.float() * v_scale[..., None]
+
+    num_requests = 2
+    pages_per_request = num_blocks // num_requests
+    block_table = (
+        torch.randperm(num_blocks, device="cuda")
+        .reshape(num_requests, pages_per_request)
+        .to(torch.int32)
+    )
+    token_to_req = (
+        torch.arange(num_rows, device="cuda", dtype=torch.int32) * num_requests
+    ) // num_rows
+    width = 700
+    logical_indices = torch.randint(
+        0,
+        pages_per_request * page_size,
+        (num_rows, width),
+        device="cuda",
+        dtype=torch.int32,
+    )
+    logical_indices[:, -50:] = -1
+    q = torch.randn(
+        num_rows, num_query_heads, head_dim, device="cuda", dtype=torch.bfloat16
+    )
+
+    actual = qsa_ops.qsa_sparse_paged_attention(
+        q,
+        k_cache,
+        v_cache,
+        logical_indices,
+        block_table,
+        token_to_req,
+        k_scale=k_scale,
+        v_scale=v_scale,
+    )
+    expected = _qsa_sparse_paged_attention_reference(
+        q,
+        k_deq,
+        v_deq,
+        logical_indices,
+        block_table,
+        token_to_req,
+        q.shape[-1] ** -0.5,
+    )
+    torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
