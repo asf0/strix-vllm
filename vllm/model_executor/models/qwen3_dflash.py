@@ -329,8 +329,10 @@ class DFlashQwen3DecoderLayer(nn.Module):
         # fixed by how the head was distilled, not by the target: a neox-trained
         # head on an interleaved target still needs neox. A mismatch is silent --
         # acceptance collapses and nothing errors -- so a checkpoint that was
-        # distilled the other way has to say so here.
+        # distilled the other way has to say so here (`rope_is_neox_style`, as
+        # SGLang reads it, or `is_neox_style`).
         is_neox_style = getattr(config, "is_neox_style", True)
+        is_neox_style = bool(getattr(config, "rope_is_neox_style", is_neox_style))
 
         self.self_attn = DFlashQwen3Attention(
             hidden_size=self.hidden_size,

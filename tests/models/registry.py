@@ -1597,6 +1597,12 @@ _SPECULATIVE_DECODING_EXAMPLE_MODELS = {
         speculative_model="Inferact/Muse-Spark-Open-DSpark",
         is_available_online=False,
     ),
+    "Lfm2DSparkDraftModel": _HfExamplesInfo(
+        "LiquidAI/LFM2.5-24B-A2B",
+        speculative_model="LiquidAI/LFM2.5-24B-A2B-DSpark",
+        is_available_online=False,
+        use_original_num_layers=True,  # DSpark backbone requires all layers
+    ),
     "Qwen3DSparkModel": _HfExamplesInfo(
         "Qwen/Qwen3-8B",
         speculative_model="deepseek-ai/dspark_qwen3_8b_block7",

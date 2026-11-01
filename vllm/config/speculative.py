@@ -91,6 +91,8 @@ _QWEN3_OMNI_TARGET_ARCHITECTURES = frozenset(
 )
 _QWEN3_OMNI_DSPARK_ARCHITECTURE = "Qwen3OmniDSparkModel"
 _MUSE_SPARK_DSPARK_ARCHITECTURE = "MuseSparkDSparkModel"
+# Draft architectures served by Qwen3DSparkModel when model_type is qwen3.
+_QWEN3_STYLE_DSPARK_ARCHITECTURES = {"DSparkDraftModel", "Lfm2DSparkDraftModel"}
 
 # Draft architectures that carry an XPress refiner. EAGLEConfig rewrites a dflash
 # draft's architecture to DFlash{arch}, so a checkpoint is seen under either name;
@@ -1461,7 +1463,8 @@ class SpeculativeConfig:
                     in self.draft_model_config.architectures
                     or "Gemma4DSparkModel" in self.draft_model_config.architectures
                     or (
-                        "DSparkDraftModel" in self.draft_model_config.architectures
+                        _QWEN3_STYLE_DSPARK_ARCHITECTURES
+                        & set(self.draft_model_config.architectures)
                         and self.draft_model_config.hf_config.model_type == "qwen3"
                     )
                 ):
@@ -1533,12 +1536,23 @@ class SpeculativeConfig:
 
                 if (
                     self.method == "dspark"
-                    and "DSparkDraftModel" in self.draft_model_config.architectures
+                    and _QWEN3_STYLE_DSPARK_ARCHITECTURES
+                    & set(self.draft_model_config.architectures)
                     and self.draft_model_config.hf_config.model_type == "qwen3"
                 ):
-                    self.draft_model_config.hf_config.architectures = [
-                        "Qwen3DSparkModel"
-                    ]
+                    hf = self.draft_model_config.hf_config
+                    # LFM2 DSpark drafts (SGLang's Lfm2DSparkDraftModel) are
+                    # Qwen3-style DSpark drafts whose confidence head reads the
+                    # Markov embedding by default (SGLang: markov_rank > 0) and
+                    # whose config does not say so.
+                    if (
+                        "Lfm2DSparkDraftModel" in hf.architectures
+                        and getattr(hf, "confidence_head_with_markov", None) is None
+                    ):
+                        hf.confidence_head_with_markov = (
+                            getattr(hf, "markov_rank", 0) or 0
+                        ) > 0
+                    hf.architectures = ["Qwen3DSparkModel"]
                     self.update_arch_()
                 elif self.method == "dspark" and (
                     "Qwen3DSparkModel" not in self.draft_model_config.architectures

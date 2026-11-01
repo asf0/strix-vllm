@@ -672,6 +672,9 @@ class Lfm2VLForConditionalGeneration(
             tp_world_size=parallel_config.tensor_parallel_size,
             intermediate_size=hf_language_config.hidden_size,
             conv_kernel=hf_language_config.conv_L_cache,
+            # Speculative decoding keeps num_spec extra conv columns (as
+            # ShortConv.get_state_shape does); the page size must count them.
+            num_spec=vllm_config.num_speculative_tokens,
         )
 
     @classmethod
