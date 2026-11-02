@@ -21,14 +21,22 @@ approximate ``ex2`` / ``rcp`` SiLU of the TRTLLM MoE (see ``moe``).
 import torch
 from torch import nn
 
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, tldevice, triton
 
+if current_platform.is_cuda():
 
-@triton.jit
-def _rsqrt(x):
-    return tl.inline_asm_elementwise(
-        "rsqrt.approx.ftz.f32 $0, $1;", "=f,f", [x], tl.float32, True, 1
-    )
+    @triton.jit
+    def _rsqrt(x):
+        return tl.inline_asm_elementwise(
+            "rsqrt.approx.ftz.f32 $0, $1;", "=f,f", [x], tl.float32, True, 1
+        )
+
+else:
+    # The PTX above does not exist elsewhere (ROCm): the portable rsqrt.
+    @triton.jit
+    def _rsqrt(x):
+        return tl.math.rsqrt(x)
 
 
 @triton.jit

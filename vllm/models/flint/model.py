@@ -40,7 +40,11 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from vllm.model_executor.model_loader.weight_utils import make_attention_sink
-from vllm.model_executor.models.interfaces import SupportsPP
+from vllm.model_executor.models.interfaces import (
+    EagleModelMixin,
+    SupportsEagle3,
+    SupportsPP,
+)
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
     WeightsMapper,
@@ -68,6 +72,14 @@ from .ops.norm import RMSNorm, silu_and_mul
 from .ops.qk_norm_rope import qk_norm_rope_cache
 from .ops.qkv_fused import MAX_M as LL_MAX_TOKENS
 from .ops.qkv_fused import flint_qkv_fused
+
+
+def _is_flashinfer_impl(impl: object) -> bool:
+    try:
+        from vllm.v1.attention.backends.flashinfer import FlashInferImpl
+    except ImportError:  # FlashInfer is not installed (e.g. ROCm)
+        return False
+    return isinstance(impl, FlashInferImpl)
 
 
 def _flint_kernels(
@@ -305,23 +317,28 @@ class FlintAttention(nn.Module):
             prefix=f"{prefix}.attn",
             sinks=self.softmax_offset,
         )
-        # The fused kernel writes the KV cache itself (in the FlashInfer layout)
-        # and then calls the attention backend directly. Imported here so the
-        # module imports on platforms without FlashInfer.
+        assert get_current_vllm_config().model_config.dtype == torch.bfloat16
+        impl = self.attn.impl
+        self.impl = impl
+        # With FlashInfer the fused kernel writes the KV cache itself (in the
+        # FlashInfer layout) and then calls the attention backend directly.
+        # Any other backend (ROCm: TRITON_ATTN) gets the same q/k RMSNorm and
+        # RoPE from the fused kernel without its cache write, and the Attention
+        # layer writes the cache in the backend's own layout and dtype.
+        self.fused_cache = _is_flashinfer_impl(impl)
+        if not self.fused_cache:
+            self.flint_decode = False
+            self.max_decode_batch = 0
+            return
         from vllm.v1.attention.backends.flashinfer import (
-            FlashInferImpl,
             FlashInferMetadata,
             FlashInferTrtllmAPIDecode,
         )
 
-        impl = self.attn.impl
-        assert isinstance(impl, FlashInferImpl), "Flint requires FlashInfer attention"
         self._metadata_cls = FlashInferMetadata
         self._decode_cls = FlashInferTrtllmAPIDecode
-        assert get_current_vllm_config().model_config.dtype == torch.bfloat16
         assert self.attn.kv_cache_dtype in ("auto", "bfloat16")
         assert impl.kv_sharing_target_layer_name is None
-        self.impl = impl
         # Flint decode attention and the fused low-latency decode path.
         self.flint_decode = _flint_kernels(quant_config)
         # Largest pure-decode batch served by the Flint kernel; beyond it
@@ -337,6 +354,25 @@ class FlintAttention(nn.Module):
         self, positions: torch.Tensor, hidden_states: torch.Tensor
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
+        if not self.fused_cache:
+            q = qk_norm_rope_cache(
+                qkv,
+                positions,
+                self.q_norm.weight,
+                self.k_norm.weight,
+                self.q_norm.variance_epsilon,
+                self._cos_sin(),
+                None,
+                None,
+                None,
+                self.num_heads,
+                self.num_kv_heads,
+                self.head_dim,
+            )
+            # The kernel normalized and rotated k in place inside qkv.
+            _, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            output, _ = self.o_proj(self.attn(q, k, v))
+            return output
         k_cache, v_cache, layer_slots = self._cache_views()
         plan = self._decode_plan() if self.flint_decode else None
         q = qk_norm_rope_cache(
@@ -538,7 +574,7 @@ class FlintDecoderLayer(nn.Module):
         return hidden_states, residual
 
 
-class FlintModel(nn.Module):
+class FlintModel(nn.Module, EagleModelMixin):
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -586,17 +622,30 @@ class FlintModel(nn.Module):
                 else self.embed_input_ids(input_ids)
             )
             residual = None
-        for layer in self.layers[self.start_layer : self.end_layer]:
-            hidden_states, residual = layer(positions, hidden_states, residual)
+        # Speculative drafts (DFlash 2) read the residual stream after the
+        # layers named in aux_hidden_state_layers.
+        aux_hidden_states: list[torch.Tensor] = []
+        self._maybe_add_hidden_state(
+            aux_hidden_states, self.start_layer, hidden_states, residual
+        )
+        for idx in range(self.start_layer, self.end_layer):
+            hidden_states, residual = self.layers[idx](
+                positions, hidden_states, residual
+            )
+            self._maybe_add_hidden_state(
+                aux_hidden_states, idx + 1, hidden_states, residual
+            )
         if self.end_layer != len(self.layers):
             return IntermediateTensors(
                 {"hidden_states": hidden_states, "residual": residual}
             )
         hidden_states, _ = self.norm(hidden_states, residual)
+        if aux_hidden_states:
+            return hidden_states, aux_hidden_states
         return hidden_states
 
 
-class FlintForCausalLM(nn.Module, SupportsPP):
+class FlintForCausalLM(nn.Module, SupportsPP, SupportsEagle3):
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_stacked={
             ".q_proj": (".qkv_proj", "q"),
