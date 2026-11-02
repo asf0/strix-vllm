@@ -11,9 +11,15 @@ rounds to bf16, and K/V are stored unchanged in the bf16 cache.
 
 import torch
 
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 
 _BLOCK_T = 16
+# Heads fastest in the launch grid on ROCm: with tokens fastest, programs that
+# run together read the same head's columns of rows ~10 KiB apart, which camp
+# on the same DRAM channels on gfx11 APUs (30 GB/s at 8k tokens, against
+# ~250 GB/s heads-first). CUDA keeps the tokens-first order it was tuned with.
+_HEADS_FASTEST = not current_platform.is_cuda()
 
 
 # A fixed token tile and no integer specialization: one compiled variant per
@@ -44,13 +50,14 @@ def _qk_norm_rope_cache_kernel(
     APPLY_ROPE: tl.constexpr,
     BLOCK_T: tl.constexpr,
     LAUNCH_DEPENDENTS: tl.constexpr,
+    HEADS_FASTEST: tl.constexpr,
 ):
     if LAUNCH_DEPENDENTS:
         # The PDL successor waits on this grid before reading q / K / V.
         tl.extra.cuda.gdc_launch_dependents()
-    head = tl.program_id(1)
+    head = tl.program_id(0 if HEADS_FASTEST else 1)
     half: tl.constexpr = HEAD_DIM // 2
-    tokens = tl.program_id(0) * BLOCK_T + tl.arange(0, BLOCK_T)
+    tokens = tl.program_id(1 if HEADS_FASTEST else 0) * BLOCK_T + tl.arange(0, BLOCK_T)
     offs = tl.arange(0, half)[None, :]
     t_mask = (tokens < num_tokens)[:, None]
     tok64 = tokens.to(tl.int64)[:, None]
@@ -158,7 +165,9 @@ def qk_norm_rope_cache(
         strides = (0, 0, 0)
         block_size = 1
         num_slots = 0
-    grid = (triton.cdiv(num_tokens, _BLOCK_T), num_q_heads + 2 * num_kv_heads)
+    num_heads = num_q_heads + 2 * num_kv_heads
+    blocks = triton.cdiv(num_tokens, _BLOCK_T)
+    grid = (num_heads, blocks) if _HEADS_FASTEST else (blocks, num_heads)
     _qk_norm_rope_cache_kernel[grid](
         qkv,
         qkv.stride(0),
@@ -181,6 +190,7 @@ def qk_norm_rope_cache(
         HEAD_DIM=head_dim,
         APPLY_ROPE=cos_sin_cache is not None,
         BLOCK_T=_BLOCK_T,
+        HEADS_FASTEST=_HEADS_FASTEST,
         LAUNCH_DEPENDENTS=launch_dependents,
         num_warps=4,
     )
