@@ -1634,14 +1634,17 @@ class Qwen4ExpForConditionalGenerationConfig(Qwen3_5ForConditionalGenerationConf
                 "Qwen4Exp PLE/QSA does not support dual-batch overlap or microbatching"
             )
         spec_config = vllm_config.speculative_config
+        # DFlash reads the averaged hyper-connection streams the model
+        # records for it (Qwen4ExpModel, aux_hidden_state_layers).
         if spec_config is not None and spec_config.method not in {
             "mtp",
             "ngram",
             "ngram_gpu",
+            "dflash",
         }:
             raise NotImplementedError(
                 "Qwen4Exp speculative decoding supports only its native MTP "
-                "checkpoint and linear n-gram proposers"
+                "checkpoint, DFlash drafts and linear n-gram proposers"
             )
 
 
