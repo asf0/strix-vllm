@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+from math import lcm
 from typing import ClassVar, cast
 
 import torch
@@ -11,6 +12,7 @@ from torch import nn
 from transformers import Qwen4ExpTextConfig
 
 from vllm.config import VllmConfig, get_current_vllm_config
+from vllm.config.vllm import get_current_vllm_config_or_none
 from vllm.config.cache import CacheDType
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.forward_context import get_forward_context
@@ -25,6 +27,7 @@ from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.models.qwen3_next import Qwen3NextAttention
 from vllm.model_executor.models.qwen3_vl import mrope_positions_factor
 from vllm.platforms import current_platform
+from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import (
     LayerNameType,
     _encode_layer_name,
@@ -123,6 +126,26 @@ _QSA_CACHE_DTYPES: tuple[CacheDType, ...] = (
 )
 
 
+def _qsa_block_alignment() -> int:
+    """16, and a multiple of the indexer's raw-key ring (QSAKeyStateCache).
+
+    The ring holds one compression group plus every speculative row, rounded
+    up to whole groups, and must divide the attention block size. Up to
+    compress_ratio draft tokens that is 2 groups (8 rows), which 16 already
+    covers; more draft tokens (DFlash 2 at 5-7) need 3 groups (12), so the
+    hybrid block size has to be chosen as a multiple of 48.
+    """
+    vllm_config = get_current_vllm_config_or_none()
+    if vllm_config is None or vllm_config.model_config is None:
+        return 16
+    text_config = vllm_config.model_config.hf_text_config
+    ratio = int(getattr(text_config, "indexer_compress_ratio", 0) or 0)
+    if ratio <= 0:
+        return 16
+    capacity = cdiv(ratio + vllm_config.num_speculative_tokens, ratio) * ratio
+    return lcm(16, capacity)
+
+
 class Qwen4ExpQSAFlashAttentionBackend(FlashAttentionBackend):
     """FullAttentionSpec backend used by the merged QSA owner.
 
@@ -153,7 +176,7 @@ class Qwen4ExpQSAFlashAttentionBackend(FlashAttentionBackend):
     @staticmethod
     def get_supported_kernel_block_sizes(kv_cache_spec=None) -> list[int | MultipleOf]:
         # QSA consumes manager pages directly and does not use FA4 paged attention.
-        return [MultipleOf(16)]
+        return [MultipleOf(_qsa_block_alignment())]
 
     @staticmethod
     def get_impl_cls() -> type[Qwen4ExpQSAFlashAttentionImpl]:

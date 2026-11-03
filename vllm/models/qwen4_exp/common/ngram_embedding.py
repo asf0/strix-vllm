@@ -656,6 +656,7 @@ class Qwen4ExpPLEDiskEmbedding(Qwen4ExpPLEEmbedding):
 
     _GATHER_THREADS: ClassVar[int] = 64
     _MIN_ROWS_PER_TASK: ClassVar[int] = 64
+    _SMALL_GATHER_ROWS: ClassVar[int] = 4096
 
     def __init__(
         self,
@@ -832,9 +833,14 @@ class Qwen4ExpPLEDiskEmbedding(Qwen4ExpPLEEmbedding):
         # A decode step gathers 16 rows, often not in the page cache: tasks of
         # 4 rows fault them in parallel (16 cold rows 0.77 ms against 2.55 ms
         # on one thread) for 0.07 ms when they are cached (one row per task:
-        # 0.47 / 0.29 ms). Larger gathers keep tasks of _MIN_ROWS_PER_TASK.
+        # 0.47 / 0.29 ms). A speculative verify step gathers 16 rows per
+        # token (80 at 5 tokens): with tasks of _MIN_ROWS_PER_TASK it faulted
+        # them on two threads, 8.75 ms against 2.66 at 3 tokens (DFlash 2
+        # with 4 draft tokens 40.7 -> 48.9 tok/s). Gathers up to
+        # _SMALL_GATHER_ROWS (a batch of verify steps) spread over all threads
+        # in tasks of at least 4 rows; prefill chunks keep tasks of 64.
         min_rows = self._MIN_ROWS_PER_TASK
-        if num_rows < min_rows:
+        if num_rows <= self._SMALL_GATHER_ROWS:
             min_rows = 4
         step = max(min_rows, -(-num_rows // self._GATHER_THREADS))
         tasks = [

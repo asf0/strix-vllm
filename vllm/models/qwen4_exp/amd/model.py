@@ -34,6 +34,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from vllm.model_executor.models.interfaces import (
+    EagleModelMixin,
     HasInnerState,
     IsHybrid,
     MixtureOfExperts,
@@ -41,6 +42,7 @@ from vllm.model_executor.models.interfaces import (
     SupportsHCSP,
     SupportsLoRA,
     SupportsMRoPE,
+    SupportsEagle3,
     SupportsPP,
     _require_is_multimodal,
 )
@@ -409,7 +411,7 @@ class Qwen4ExpMixtureOfExperts(MixtureOfExperts):
         "deepstack_input_embeds": 0,
     }
 )
-class Qwen4ExpModel(nn.Module):
+class Qwen4ExpModel(nn.Module, EagleModelMixin):
     hf_to_vllm_mapper = Qwen3_5Model.hf_to_vllm_mapper | _EXTRA_WEIGHTS_MAPPER
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
@@ -524,6 +526,7 @@ class Qwen4ExpModel(nn.Module):
         block_output = None
         injection = None
         last_layer = None
+        aux_hidden_states: list[torch.Tensor] = []
         for layer_idx, layer in islice(
             enumerate(self.layers), self.start_layer, self.end_layer
         ):
@@ -562,6 +565,23 @@ class Qwen4ExpModel(nn.Module):
                 block_output = None
                 injection = None
                 hidden_states = hidden_states + deepstack_embed
+            if layer_idx + 1 in self.aux_hidden_state_layers:
+                # DFlash 2 drafts read the completed output of this layer,
+                # averaged over the hyper-connection streams. The layers
+                # combine lazily, so materialize the state here; the next
+                # layer then mixes instead of combine-and-mix (same math).
+                if block_output is not None:
+                    hidden_states = layer.mlp_hyper_connection.combine(
+                        hidden_states, block_output, injection
+                    )
+                    block_output = None
+                    injection = None
+                aux = hidden_states.unflatten(
+                    -1, (self.config.hc_count, self.config.hidden_size)
+                ).mean(dim=-2)
+                if self.use_hc_sequence_parallel:
+                    aux = sp_all_gather(aux)[:full_num_tokens]
+                aux_hidden_states.append(aux)
 
         if not get_pp_group().is_last_rank:
             # PP transports one tensor, not the delayed HC tuple. Materialize
@@ -603,6 +623,8 @@ class Qwen4ExpModel(nn.Module):
             # this tensor is needed by the final mixer regardless).
             num_tokens = multi_hidden.shape[0]
             self._mtp_hidden_buffer[:num_tokens].copy_(multi_hidden)
+        if aux_hidden_states:
+            return sample_hidden_states, aux_hidden_states
         return sample_hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
@@ -664,6 +686,7 @@ class Qwen4ExpDiskPLEWeights:
 class Qwen4ExpForCausalLM(
     nn.Module,
     HasInnerState,
+    SupportsEagle3,
     SupportsHCSP,
     SupportsLoRA,
     SupportsMRoPE,
