@@ -417,6 +417,10 @@ class Qwen4ExpMTP(nn.Module, SupportsHCSP, SupportsPP, Qwen4ExpMixtureOfExperts)
 
         super().__init__()
         self.config = config
+        if getattr(config, "mtp_draft_vocab_size", None) is not None:
+            raise NotImplementedError(
+                "mtp_draft_vocab_size is currently implemented for ROCm only"
+            )
         self.model = Qwen4ExpMultiTokenPredictor(
             vllm_config=vllm_config,
             prefix=maybe_prefix(prefix, "mtp"),

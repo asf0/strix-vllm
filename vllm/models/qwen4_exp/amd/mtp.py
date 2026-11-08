@@ -23,14 +23,19 @@ from transformers import Qwen4ExpTextConfig
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig, replace, set_current_vllm_config
 from vllm.distributed import get_pp_group
+from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.utils import (
     is_model_fused_shared_expert_compatible,
 )
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm
-from vllm.model_executor.layers.linear import ColumnParallelLinear
+from vllm.model_executor.layers.linear import (
+    ColumnParallelLinear,
+    UnquantizedLinearMethod,
+)
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
+    UnquantizedEmbeddingMethod,
     VocabParallelEmbedding,
 )
 from vllm.model_executor.model_loader.utils import configure_quant_config
@@ -47,6 +52,7 @@ from vllm.model_executor.models.utils import (
 )
 from vllm.models.common.ops.sequence_parallel import sp_all_gather, sp_shard
 from vllm.sequence import IntermediateTensors
+from vllm.tokenizers import get_tokenizer
 
 from ..common.hyperconnection import is_hc_sequence_parallel_enabled
 from .hyperconnection import GatedResidual, HyperConnectionConfig
@@ -58,6 +64,82 @@ from .model import (
     Qwen4ExpMixtureOfExperts,
     Qwen4ExpSparseMoeBlock,
 )
+
+logger = init_logger(__name__)
+
+
+def _draft_token_ids(config: Qwen4ExpTextConfig, model_config) -> list[int]:
+    """Leading BPE rows plus every token the tokenizer adds to that BPE."""
+    prefix_size = config.mtp_draft_vocab_size
+    tokenizer = get_tokenizer(
+        model_config.tokenizer,
+        trust_remote_code=model_config.trust_remote_code,
+        revision=model_config.tokenizer_revision,
+    )
+    ids = set(range(prefix_size))
+    extra_ids = [
+        *tokenizer.all_special_ids,
+        *tokenizer.get_added_vocab().values(),
+    ]
+    ids.update(id for id in extra_ids if 0 <= id < config.vocab_size)
+    return sorted(ids)
+
+
+def _reduce_lm_head(
+    lm_head: VocabParallelEmbedding, token_ids: list[int]
+) -> ParallelLMHead:
+    """Copy selected rows into an unquantized, single-TP draft head."""
+    if lm_head.tp_size != 1:
+        raise ValueError(
+            "mtp_draft_vocab_size currently requires tensor_parallel_size=1"
+        )
+    if not isinstance(
+        lm_head.quant_method, (UnquantizedEmbeddingMethod, UnquantizedLinearMethod)
+    ):
+        raise ValueError("mtp_draft_vocab_size requires an unquantized MTP LM head")
+    if getattr(lm_head, "bias", None) is not None:
+        raise ValueError("mtp_draft_vocab_size does not support an LM-head bias")
+
+    # The reduced head pads to the next multiple of 64. Its trailing rows are
+    # uninitialized: greedy argmax masks them (LogitsProcessor.get_top_tokens
+    # respects shard_indices.num_org_vocab_padding), and the projection path
+    # slices them off before scattering back to the full vocabulary.
+    reduced = ParallelLMHead(
+        len(token_ids),
+        lm_head.embedding_dim,
+        params_dtype=lm_head.weight.dtype,
+        disable_tp=True,
+    ).to(lm_head.weight.device)
+    prefix_size = 0
+    for prefix_size, token_id in enumerate(token_ids, start=1):
+        if token_id != prefix_size - 1:
+            prefix_size -= 1
+            break
+    else:
+        prefix_size = len(token_ids)
+
+    with torch.no_grad():
+        reduced.weight[:prefix_size].copy_(lm_head.weight[:prefix_size])
+        if prefix_size < len(token_ids):
+            extra_ids = torch.tensor(
+                token_ids[prefix_size:], device=lm_head.weight.device
+            )
+            reduced.weight[prefix_size : len(token_ids)].copy_(
+                lm_head.weight.index_select(0, extra_ids)
+            )
+    return reduced
+
+
+def _scatter_draft_logits(
+    reduced_logits: torch.Tensor, token_ids: torch.Tensor, vocab_size: int
+) -> torch.Tensor:
+    """Restore target-vocabulary positions; omitted proposals are impossible."""
+    reduced_logits = reduced_logits[..., : token_ids.numel()]
+    logits = reduced_logits.new_full(
+        (*reduced_logits.shape[:-1], vocab_size), -float("inf")
+    )
+    ids = token_ids.view((1,) * (reduced_logits.ndim - 1) + (-1,))
+    return logits.scatter(-1, ids.expand_as(reduced_logits), reduced_logits)
 
 
 def _remap_ignored_layers(
@@ -415,6 +497,15 @@ class Qwen4ExpMTP(nn.Module, SupportsHCSP, SupportsPP, Qwen4ExpMixtureOfExperts)
 
         super().__init__()
         self.config = config
+        self.vocab_size = config.vocab_size
+        self.draft_token_ids: torch.Tensor | None = None
+        self._draft_token_id_list: list[int] | None = None
+        if getattr(config, "mtp_draft_vocab_size", None) is not None:
+            # The runner attaches the target's (borrowed) LM head at the share
+            # point; install_draft_vocab() then swaps in the reduced head.
+            self._draft_token_id_list = _draft_token_ids(
+                config, vllm_config.model_config
+            )
         self.model = Qwen4ExpMultiTokenPredictor(
             vllm_config=vllm_config,
             prefix=maybe_prefix(prefix, "mtp"),
@@ -463,7 +554,43 @@ class Qwen4ExpMTP(nn.Module, SupportsHCSP, SupportsPP, Qwen4ExpMixtureOfExperts)
     def compute_logits(
         self, hidden_states: torch.Tensor, spec_step_idx: int = 0
     ) -> torch.Tensor | None:
-        return self.logits_processor(self.lm_head, hidden_states)
+        logits = self.logits_processor(self.lm_head, hidden_states)
+        token_ids = self.draft_token_ids
+        if logits is not None and token_ids is not None:
+            return _scatter_draft_logits(logits, token_ids, self.vocab_size)
+        return logits
+
+    def get_top_tokens(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        token_ids = self.logits_processor.get_top_tokens(self.lm_head, hidden_states)
+        draft_token_ids = self.draft_token_ids
+        if draft_token_ids is not None:
+            return draft_token_ids[token_ids]
+        return token_ids
+
+    def install_draft_vocab(self, borrowed_lm_head) -> None:
+        """Reduce the borrowed target LM head for drafting only.
+
+        The target keeps its own full head for verification; the drafter gets
+        a reduced copy and maps its argmax back to target token ids.
+        """
+        if self._draft_token_id_list is None:
+            return
+        token_id_list = self._draft_token_id_list
+        self._draft_token_id_list = None
+        self.lm_head = _reduce_lm_head(borrowed_lm_head, token_id_list)
+        self.register_buffer(
+            "draft_token_ids",
+            torch.tensor(
+                token_id_list, device=self.lm_head.weight.device, dtype=torch.long
+            ),
+            persistent=False,
+        )
+        logger.info(
+            "Qwen4Exp MTP draft head: %d of %d vocabulary rows from the "
+            "target's LM head",
+            len(token_id_list),
+            self.vocab_size,
+        )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         def remap_weight_names():

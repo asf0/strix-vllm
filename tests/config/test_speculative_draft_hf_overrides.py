@@ -231,6 +231,7 @@ def test_composed_override_is_picklable():
 def _make_mtp_speculative_config(
     override: bool | None,
     checkpoint_value: bool,
+    draft_vocab_size: int | None = None,
 ) -> SpeculativeConfig:
     draft_hf_config = _make_hf_config(
         architectures=["Qwen4ExpMTP"],
@@ -244,6 +245,7 @@ def _make_mtp_speculative_config(
         architectures=draft_hf_config.architectures,
         max_model_len=128,
     )
+    draft_model_config.get_vocab_size.return_value = 248320
     target_model_config = MagicMock(
         model="target",
         max_model_len=128,
@@ -258,6 +260,7 @@ def _make_mtp_speculative_config(
             method="mtp",
             num_speculative_tokens=1,
             index_share_for_mtp_iteration=override,
+            mtp_draft_vocab_size=draft_vocab_size,
             target_model_config=target_model_config,
             target_parallel_config=ParallelConfig(),
         )
@@ -276,6 +279,15 @@ def test_mtp_index_share_override(
         speculative_config.draft_model_config.hf_config.index_share_for_mtp_iteration
         is expected
     )
+
+
+@pytest.mark.cpu_test
+def test_qwen4exp_mtp_draft_vocab_override():
+    config = _make_mtp_speculative_config(None, False, draft_vocab_size=94208)
+    assert config.draft_model_config.hf_config.mtp_draft_vocab_size == 94208
+
+    with pytest.raises(ValueError, match="smaller than the full vocabulary"):
+        _make_mtp_speculative_config(None, False, draft_vocab_size=248320)
 
 
 @pytest.mark.cpu_test

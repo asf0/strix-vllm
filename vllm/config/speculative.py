@@ -465,6 +465,9 @@ class SpeculativeConfig:
     index_share_for_mtp_iteration: bool | None = None
     """Override whether MTP iterations reuse the first step's sparse indices.
     If `None`, use the value from the draft model's Hugging Face config."""
+    mtp_draft_vocab_size: int | None = Field(default=None, gt=0)
+    """Restrict Qwen4Exp MTP drafting to this leading vocabulary prefix plus
+    special and added tokens. The target still verifies over the full vocabulary."""
 
     # Advanced control
     disable_padded_drafter_batch: bool = False
@@ -1723,6 +1726,34 @@ class SpeculativeConfig:
             self.draft_model_config.hf_config.index_share_for_mtp_iteration = (
                 self.index_share_for_mtp_iteration
             )
+
+        if self.mtp_draft_vocab_size is not None:
+            draft = self.draft_model_config
+            if (
+                self.method != "mtp"
+                or draft is None
+                or draft.architectures != ["Qwen4ExpMTP"]
+            ):
+                raise ValueError(
+                    "mtp_draft_vocab_size is only supported by Qwen4Exp MTP"
+                )
+            if self.draft_lm_head_quantization is not None:
+                raise ValueError(
+                    "mtp_draft_vocab_size cannot be combined with "
+                    "draft_lm_head_quantization"
+                )
+            vocab_size = draft.get_vocab_size()
+            if self.mtp_draft_vocab_size >= vocab_size:
+                raise ValueError(
+                    f"mtp_draft_vocab_size must be smaller than the full "
+                    f"vocabulary ({vocab_size})"
+                )
+            draft.hf_config.mtp_draft_vocab_size = self.mtp_draft_vocab_size
+            # The draft model reads this off its text config; on multimodal
+            # checkpoints that is a different object from hf_config.
+            text_config = get_hf_text_config(draft.hf_config)
+            if text_config is not draft.hf_config:
+                text_config.mtp_draft_vocab_size = self.mtp_draft_vocab_size
 
         if (
             self.method != "dspark"

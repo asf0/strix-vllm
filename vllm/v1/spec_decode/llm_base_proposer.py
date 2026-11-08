@@ -1575,6 +1575,13 @@ class SpecDecodeBaseProposer:
                             "Shared target model lm_head with MTP shared_head.head."
                         )
 
+            # A reduced draft-vocabulary head is cut from the borrowed target
+            # head after sharing; the target keeps its own full head.
+            if self.speculative_config.mtp_draft_vocab_size is not None and hasattr(
+                self.model, "install_draft_vocab"
+            ):
+                self.model.install_draft_vocab(target_language_model.lm_head)
+
         if hasattr(target_language_model.model, "topk_indices_buffer"):
             target_buffer = target_language_model.model.topk_indices_buffer
             if hasattr(self.model.model, "topk_indices_buffer"):

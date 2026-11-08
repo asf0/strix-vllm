@@ -128,6 +128,13 @@ def load_eagle_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mod
                 if sh is not None and hasattr(sh, "head"):
                     del sh.head
                     sh.head = draft_head
+
+        # A reduced draft-vocabulary head is cut from the borrowed target
+        # head after sharing; the target keeps its own full head.
+        if speculative_config.mtp_draft_vocab_size is not None and hasattr(
+            eagle_model, "install_draft_vocab"
+        ):
+            eagle_model.install_draft_vocab(target_lm_head)
     elif speculative_config.draft_lm_head_quantization is not None:
         raise ValueError(
             "draft_lm_head_quantization needs a drafter that shares the target lm_head."
