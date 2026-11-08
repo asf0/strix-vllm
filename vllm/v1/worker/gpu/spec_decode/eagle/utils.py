@@ -154,6 +154,15 @@ def load_eagle_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mod
                     del sh.head
                     sh.head = draft_head
 
+        # A reduced draft-vocabulary head is cut from the borrowed target
+        # head after sharing; the target keeps its own full head.
+        if speculative_config.mtp_draft_vocab_size is not None and hasattr(
+            eagle_model, "install_draft_vocab"
+        ):
+            eagle_model.install_draft_vocab(
+                get_target_lm_head(target_model, target_language_model)
+            )
+
     # MTP shares topk_indices_buffer with the target model. We update
     # every module in the draft that holds a buffer reference so that
     # the per-layer indexer and sparse-attention backends all point to
