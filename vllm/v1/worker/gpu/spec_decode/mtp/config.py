@@ -19,7 +19,8 @@ class MTPSpeculatorConfig(EagleSpeculatorConfig):
     base_method = "mtp"
     speculator_class = "vllm.v1.worker.gpu.spec_decode.mtp.speculator.MTPSpeculator"
     supported_options = EagleSpeculatorConfig.supported_options | {
-        "index_share_for_mtp_iteration"
+        "index_share_for_mtp_iteration",
+        "mtp_draft_vocab_size",
     }
     supports_pcp = True
 
