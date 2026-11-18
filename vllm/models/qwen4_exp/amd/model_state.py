@@ -30,7 +30,7 @@ class Qwen4ExpModelState(MambaHybridModelState):
         super().__init__(vllm_config, model, encoder_cache, device)
         config = self.model_config.hf_text_config
         self.uses_ngram_embedding = bool(config.ple_layer_ids)
-        self._disk_ple: list[tuple[nn.Module, Qwen4ExpPLEDiskEmbedding]] = []
+        self.disk_offload_modules: list[tuple[nn.Module, Qwen4ExpPLEDiskEmbedding]] = []
         self._ple_hash_params: list[tuple[np.ndarray, ...]] | None = None
         self._host_prefill_tokens: dict[str, np.ndarray] = {}
         if not self.uses_ngram_embedding:
@@ -58,7 +58,7 @@ class Qwen4ExpModelState(MambaHybridModelState):
         )
         # Disk-offloaded n-gram table: hash pure-prefill steps on the host and
         # start their row gather here, before the GPU reaches the PLE layer.
-        self._disk_ple = [
+        self.disk_offload_modules = [
             (module, module.ngram_embedding)
             for module in model.modules()
             if isinstance(
@@ -101,7 +101,7 @@ class Qwen4ExpModelState(MambaHybridModelState):
 
     def add_request(self, req_index: int, new_req_data: NewRequestData) -> None:
         super().add_request(req_index, new_req_data)
-        if self._disk_ple and new_req_data.prefill_token_ids is not None:
+        if self.disk_offload_modules and new_req_data.prefill_token_ids is not None:
             self._host_prefill_tokens[new_req_data.req_id] = np.asarray(
                 new_req_data.prefill_token_ids, dtype=np.int64
             )
@@ -163,9 +163,11 @@ class Qwen4ExpModelState(MambaHybridModelState):
                     owner.ngram_heads_vocab_sizes.cpu().numpy(),
                     owner.ngram_heads_offsets.cpu().numpy(),
                 )
-                for owner, _ in self._disk_ple
+                for owner, _ in self.disk_offload_modules
             ]
-        for (owner, embedding), params in zip(self._disk_ple, self._ple_hash_params):
+        for (owner, embedding), params in zip(
+            self.disk_offload_modules, self._ple_hash_params
+        ):
             ids, next_ids = (
                 np.concatenate(
                     [
@@ -194,7 +196,7 @@ class Qwen4ExpModelState(MambaHybridModelState):
         model_inputs = super().prepare_inputs(input_batch, req_states)
         if not self.uses_ngram_embedding:
             return model_inputs
-        if self._disk_ple:
+        if self.disk_offload_modules:
             self._prefetch_disk_ple(input_batch)
 
         num_reqs_padded = input_batch.num_reqs_after_padding
