@@ -61,6 +61,7 @@ from vllm.v1.core.kv_cache_planning import (
     finalize_extensible_kv_cache,
     get_global_kv_cache_groups,
     get_kv_cache_configs,
+    uses_multiple_kv_cache_pools,
 )
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
@@ -319,6 +320,14 @@ class EngineCore:
 
         global_kv_cache_groups = get_global_kv_cache_groups(vllm_config, kv_cache_specs)
         vllm_config.adjust_dcp_kv_cache_interleave_size(global_kv_cache_groups)
+        if vllm_config.cache_config.enable_extensible_kv_cache and (
+            uses_multiple_kv_cache_pools(vllm_config, global_kv_cache_groups)
+        ):
+            # The extensible KV cache maps one block pool; heterogeneous-width
+            # physical pools are allocated the classic way.
+            self.model_executor.disable_extensible_kv_cache(
+                "the KV cache groups use heterogeneous-width physical pools"
+            )
         self.model_executor.set_kv_cache_layout(
             layout.name, vllm_config.parallel_config.cp_kv_cache_interleave_size
         )

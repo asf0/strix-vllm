@@ -47,6 +47,7 @@ from vllm.distributed.parallel_state import get_dcp_group, get_pp_group
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.all2all_utils import get_ep_all2all_manager
+from vllm.model_executor.layers.mamba.abstract import MambaBase
 from vllm.model_executor.layers.mamba.ops.ssu_dispatch import (
     initialize_mamba_ssu_backend,
 )
@@ -851,13 +852,34 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 ),
                 allocate=allocate_fn,
             )
-        self.kv_caches = [
-            cache for cache in kv_caches_dict.values() if cache.device == self.device
-        ]
+        # Pair each cache with its group so block copies use the right pool.
+        # Layers outside every group alias a grouped layer's cache.
+        group_id_by_layer = {
+            layer_name: group_id
+            for group_id, group in enumerate(self.kv_cache_config.kv_cache_groups)
+            for layer_name in group.layer_names
+        }
+        self.kv_caches: list[torch.Tensor] = []
+        self.kv_cache_group_ids: list[int] = []
+        for layer_name, cache in kv_caches_dict.items():
+            group_id = group_id_by_layer.get(layer_name)
+            if cache.device == self.device and group_id is not None:
+                self.kv_caches.append(cache)
+                self.kv_cache_group_ids.append(group_id)
         self.model_state.initialize_kv_cache(self.kv_cache_config, self.block_tables)
         self.replayssm_block_copy_tensors = get_replayssm_block_copy_tensors(
             self.compilation_config.static_forward_context
         )
+        # Each tracker follows its Mamba layer's group (two per layer, in the
+        # order get_replayssm_block_copy_tensors returns them).
+        self.replayssm_block_copy_group_ids = [
+            group_id_by_layer[layer_name]
+            for layer_name, layer in (
+                self.compilation_config.static_forward_context.items()
+            )
+            if isinstance(layer, MambaBase) and layer.use_flashinfer_replayssm
+            for _ in range(2)
+        ]
 
         if is_profiling:
             self.kv_connector = NO_OP_KV_CONNECTOR
@@ -880,7 +902,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             attn_groups_iter=(g for groups in self.attn_groups for g in groups),
             kernel_block_sizes=self.kernel_block_sizes,
             static_forward_context=self.compilation_config.static_forward_context,
-            num_blocks=self.kv_cache_config.num_blocks,
+            # Separate physical pools may have different logical block
+            # counts. KVBlockZeroer derives each group's split ratio directly
+            # from its cache spec in that case.
+            num_blocks=(
+                None
+                if self.kv_cache_config.kv_cache_pools is not None
+                else self.kv_cache_config.num_blocks
+            ),
         )
 
     @torch.inference_mode()
@@ -1337,6 +1366,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if self.sampler is not None:
                 self.sampler.apply_staged_writes()
 
+    def _kv_cache_num_blocks_per_group(self) -> int | list[int]:
+        """Scheduler blocks each group addresses: one count for the shared
+        pool, or each group's own pool size with heterogeneous-width pools."""
+        config = self.kv_cache_config
+        if not config.uses_multiple_pools:
+            return config.num_blocks
+        return [
+            config.get_num_blocks(group_id)
+            for group_id in range(len(config.kv_cache_groups))
+        ]
+
     def update_requests(self, scheduler_output: SchedulerOutput) -> None:
         # Add new blocks and update num_computed_tokens for the existing requests.
         reqs = scheduler_output.scheduled_cached_reqs
@@ -1369,8 +1409,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if scheduler_output.kv_cache_block_copies:
             copy_kv_cache_blocks_inplace(
                 [*self.kv_caches, *self.replayssm_block_copy_tensors],
-                self.kv_cache_config.num_blocks,
+                self._kv_cache_num_blocks_per_group(),
                 scheduler_output.kv_cache_block_copies,
+                [*self.kv_cache_group_ids, *self.replayssm_block_copy_group_ids],
             )
 
     def gather_batch_req_state(
@@ -1975,7 +2016,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     input_batch, valid_dummy_state_slots
                 )
                 if context_len:
-                    if self.extensible_kv_cache is not None:
+                    num_blocks: int | list[int]
+                    if self.kv_cache_config.uses_multiple_pools:
+                        num_blocks = self._kv_cache_num_blocks_per_group()
+                    elif self.extensible_kv_cache is not None:
                         num_blocks = self.extensible_kv_cache.num_committed_blocks
                     else:
                         num_blocks = self.kv_cache_config.num_blocks
