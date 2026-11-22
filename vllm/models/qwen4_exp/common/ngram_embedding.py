@@ -852,7 +852,7 @@ class Qwen4ExpPLEDiskEmbedding(Qwen4ExpPLEEmbedding):
             torch.index_select(self._rows, 0, file_rows, out=out)
 
     def _gather_rows(self, ids: torch.Tensor, staging: torch.Tensor) -> None:
-        """Copy the table rows of host ``ids`` into ``staging`` on the pool."""
+        """Copy the table rows of host `ids` into `staging` on the pool."""
         assert self._pool is not None and self._row_starts is not None
         num_rows = ids.numel()
         if _DISK_VERIFY:
@@ -918,7 +918,7 @@ class Qwen4ExpPLEDiskEmbedding(Qwen4ExpPLEEmbedding):
         copying its ids to the host, so the gather overlaps the GPU work queued
         before it instead of following a stream sync.
 
-        ``next_ids`` (the following prompt chunk's ids) are read into the page
+        `next_ids` (the following prompt chunk's ids) are read into the page
         cache after this step's gather, while the GPU runs this step: a chunk
         whose rows are cached gathers in tens of ms instead of ~0.5 s cold.
         """
@@ -956,7 +956,7 @@ class Qwen4ExpPLEDiskEmbedding(Qwen4ExpPLEEmbedding):
         raise RuntimeError("Disk PLE embedding does not support prefetch")
 
     def forward(self, ngram_ids: torch.Tensor) -> torch.Tensor:
-        """Gather the rows for ``ngram_ids`` on the host and return them on device."""
+        """Gather the rows for `ngram_ids` on the host and return them on device."""
         if self._rows is None:
             self._map_table()
         assert self._pool is not None
@@ -1009,7 +1009,9 @@ class Qwen4ExpPLEDiskEmbedding(Qwen4ExpPLEEmbedding):
             gpu_ids = ngram_ids.reshape(-1).cpu()
             bad = int((gpu_ids != host_ids).sum())
             if bad:
-                logger.warning("PLE host n-gram ids: %d of %d differ", bad, gpu_ids.numel())
+                logger.warning(
+                    "PLE host n-gram ids: %d of %d differ", bad, gpu_ids.numel()
+                )
         rows = staging.view(self.weight.dtype).view(*ngram_ids.shape, -1)
         rows = rows.to(ngram_ids.device, non_blocking=True)
         event.record()

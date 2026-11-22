@@ -4,7 +4,7 @@
 
 RecoverSSM must reproduce the existing spec kernel exactly: the same outputs
 during verify, and after the commit the same recurrent state and conv window
-the baseline would read from slot ``num_accepted - 1`` on the next step.
+the baseline would read from slot `num_accepted - 1` on the next step.
 """
 
 from __future__ import annotations
@@ -324,10 +324,10 @@ def _build_layer(kv_cache, A_log, dt_bias, conv_weight, use_recoverssm):
 
 @torch.inference_mode()
 def test_forward_core_two_steps_match_spec_slots():
-    """Two MTP steps through the real builder and ``_forward_core``.
+    """Two MTP steps through the real builder and `_forward_core`.
 
     The second step only matches if the commit left the checkpoint and conv
-    window where the baseline reads them via ``num_accepted_tokens``.
+    window where the baseline reads them via `num_accepted_tokens`.
     """
     torch.manual_seed(7)
     vllm_config = _make_vllm_config()

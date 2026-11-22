@@ -56,6 +56,7 @@ from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
 from vllm.model_executor.layers.mamba.ops.gather_initial_states import (
     gather_initial_states,
 )
+from vllm.model_executor.layers.mamba.ops.gdn_recoverssm import gdn_recoverssm_verify
 from vllm.model_executor.layers.mamba.ops.hip_gdn_chunk import (
     chunk_gdn_hip_fwd,
     is_hip_gdn_available,
@@ -64,7 +65,6 @@ from vllm.model_executor.layers.mamba.ops.hip_gdn_chunk import (
 from vllm.model_executor.layers.mamba.ops.scatter_states import (
     scatter_states,
 )
-from vllm.model_executor.layers.mamba.ops.gdn_recoverssm import gdn_recoverssm_verify
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.quantization.auto_awq import AutoAWQConfig
 from vllm.model_executor.layers.quantization.auto_gptq import AutoGPTQConfig

@@ -376,10 +376,27 @@ def _qsa_mqa_paged_dot_kernel(
         return
 
     acc, column_ok = _qsa_mqa_tile_scores(
-        q_ptr, k_cache_ptr, page_table_ptr, 0, rows, row_mask, columns,
-        stride_q_row, stride_q_head, stride_cache_block, stride_cache_token,
-        stride_table_req, stride_table_page, num_columns, num_pages, PAGE_SIZE,
-        PAGE_TABLE_WIDTH, NUM_HEADS, HEAD_DIM, BLOCK_M, BLOCK_N,
+        q_ptr,
+        k_cache_ptr,
+        page_table_ptr,
+        0,
+        rows,
+        row_mask,
+        columns,
+        stride_q_row,
+        stride_q_head,
+        stride_cache_block,
+        stride_cache_token,
+        stride_table_req,
+        stride_table_page,
+        num_columns,
+        num_pages,
+        PAGE_SIZE,
+        PAGE_TABLE_WIDTH,
+        NUM_HEADS,
+        HEAD_DIM,
+        BLOCK_M,
+        BLOCK_N,
     )
     score = tl.where(
         request_ok[:, None] & column_ok[None, :], acc / score_divisor, -float("inf")
@@ -1136,7 +1153,7 @@ def qsa_select_paged_tokens(
 ) -> torch.Tensor:
     """Score, select, and expand QSA indices without host synchronization.
 
-    ``max_seq_len`` (the batch's longest request, host side) bounds the score
+    `max_seq_len` (the batch's longest request, host side) bounds the score
     width for large batches; otherwise it spans the page table's capacity."""
     rows = q.shape[0]
     output_width = token_topk + compress_ratio - 1

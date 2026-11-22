@@ -36,10 +36,10 @@ from vllm.model_executor.models.interfaces import (
     IsHybrid,
     MixtureOfExperts,
     MultiModalEmbeddings,
+    SupportsEagle3,
     SupportsHCSP,
     SupportsLoRA,
     SupportsMRoPE,
-    SupportsEagle3,
     SupportsPP,
     _require_is_multimodal,
 )

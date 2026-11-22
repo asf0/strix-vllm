@@ -118,7 +118,7 @@ class Qwen4ExpModelState(MambaHybridModelState):
         offsets: np.ndarray,
         heads_per_ngram: int,
     ) -> np.ndarray:
-        """Host copy of ple_ngram_ids for one request: ``tokens`` is the
+        """Host copy of ple_ngram_ids for one request: `tokens` is the
         n-gram context (EOS-padded) followed by the scheduled tokens."""
         ctx = self.ngram_context_len
         eos = self.ngram_eos_token_id
@@ -165,7 +165,9 @@ class Qwen4ExpModelState(MambaHybridModelState):
                 )
                 for owner, _ in self.disk_offload_modules
             ]
-        for (owner, embedding), params in zip(self.disk_offload_modules, self._ple_hash_params):
+        for (owner, embedding), params in zip(
+            self.disk_offload_modules, self._ple_hash_params
+        ):
             ids, next_ids = (
                 np.concatenate(
                     [

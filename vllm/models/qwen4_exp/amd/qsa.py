@@ -13,8 +13,8 @@ from transformers import Qwen4ExpTextConfig
 
 from vllm import _custom_ops as ops
 from vllm.config import VllmConfig, get_current_vllm_config
-from vllm.config.vllm import get_current_vllm_config_or_none
 from vllm.config.cache import CacheDType
+from vllm.config.vllm import get_current_vllm_config_or_none
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.attention.attention import (
