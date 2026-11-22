@@ -1254,14 +1254,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     @torch.inference_mode()
     def profile_adaptive_verification(self) -> None:
         """Seed adaptive verification's cost curves from timed dummy runs, which
-        read KV context from the committed blocks."""
+        read KV context from the committed blocks. Random token ids, so an MoE
+        step's cost reflects the experts a real batch of that size touches."""
         assert self.adaptive_verification is not None
         assert self.cudagraph_manager is not None
         with self.step_timing.collect() as timings:
             for batch in self.adaptive_verification.batches_to_profile(
                 self.cudagraph_manager.captured_token_counts()
             ):
-                self._dummy_run(**batch, skip_eplb=True)
+                self._dummy_run(**batch, skip_eplb=True, randomize_inputs=True)
         self.adaptive_verification.set_initial_cost_curves(timings)
 
     def _remove_request(self, req_id: str) -> bool:
@@ -1999,8 +2000,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.input_buffers,
                 max_query_len=batch_desc.max_query_len,
                 # Profiling and warmup must route the dummy tokens to experts
-                # so MoE memory is measured and MoE kernels are exercised.
-                is_padding=not is_profile,
+                # so MoE memory is measured and MoE kernels are exercised; so
+                # must randomized runs, which time real expert routing.
+                is_padding=not (is_profile or randomize_inputs),
             )
             if randomize_inputs:
                 # All-zero input_ids route every token to the same experts.
