@@ -1116,8 +1116,16 @@ class Platform:
                         draft_spec
                     ).page_size_bytes
                     if draft_page_size_1_token > attn_page_size_1_token:
-                        attn_page_size_1_token = lcm(
-                            attn_page_size_1_token, draft_page_size_1_token
+                        common = lcm(attn_page_size_1_token, draft_page_size_1_token)
+                        # Pages that are not near multiples (e.g. quantized KV
+                        # with per-head scales) have a huge lcm, which would pad
+                        # every Mamba page many times over. Size for the
+                        # drafter instead; unify_kv_cache_spec_page_size grows
+                        # the target's block and pads only the remainder.
+                        attn_page_size_1_token = (
+                            common
+                            if common <= 2 * draft_page_size_1_token
+                            else draft_page_size_1_token
                         )
 
         # Compute mamba page size

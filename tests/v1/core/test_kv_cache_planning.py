@@ -2019,6 +2019,29 @@ def test_unify_kv_cache_page_size_uses_padding_for_non_divisible_sizes():
     assert unified_draft_spec.page_size_bytes == target_spec.page_size_bytes
 
 
+def test_unify_kv_cache_page_size_grows_block_before_padding():
+    """A page just under half the maximum (e.g. int8 KV with per-head scales
+    next to a wider drafter) doubles its block and pads only the remainder,
+    instead of padding a single block to twice its size."""
+    small_spec = new_kv_cache_spec(
+        block_size=16, num_kv_heads=1, head_size=120, dtype=torch.bfloat16
+    )
+    large_spec = new_kv_cache_spec(
+        block_size=16, num_kv_heads=1, head_size=256, dtype=torch.bfloat16
+    )
+
+    unified = kv_cache_planning.unify_kv_cache_spec_page_size(
+        {"small": full_layer(small_spec), "large": full_layer(large_spec)}
+    )
+
+    grown = unified["small"].spec
+    assert isinstance(grown, AttentionSpec)
+    assert grown.block_size == 2 * small_spec.block_size
+    assert grown.real_page_size_bytes == 2 * small_spec.page_size_bytes
+    assert grown.page_size_bytes == large_spec.page_size_bytes
+    assert unified["large"].spec == large_spec
+
+
 def test_unify_hybrid_kv_cache_specs():
     # 1. has_full_attention and has_sliding_window
     before_spec_1 = new_kv_cache_layer(block_size=64)

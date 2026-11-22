@@ -265,7 +265,15 @@ def unify_kv_cache_spec_page_size(
             elif isinstance(layer_spec, AttentionSpec) and not isinstance(
                 layer_spec, MLAAttentionSpec
             ):
-                new_spec = replace(layer_spec, page_size_padded=max_page_size)
+                # Grow the block by the whole page ratio first, so only the
+                # remainder is padding (e.g. 1.5% instead of 2x for a page
+                # just under half the maximum).
+                ratio = max_page_size // layer_page_size
+                new_spec = replace(
+                    layer_spec,
+                    block_size=layer_spec.block_size * ratio,
+                    page_size_padded=max_page_size,
+                )
             else:
                 raise NotImplementedError(
                     f"Layer {layer_name}: page size is not divisible by the "
