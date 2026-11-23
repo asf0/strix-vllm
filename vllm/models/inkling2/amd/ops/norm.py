@@ -109,6 +109,7 @@ def qr_clip_rel_tokens(
     HAS_TAU: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_E: tl.constexpr,
+    R_ONLY: tl.constexpr = False,
 ):
     """For tokens `[t0, t0 + num_t)`: per-head L2 clipping of `q * q_scale`
     (`chunk < 0`) or of `r * r_scale` and the `BLOCK_E` columns `chunk`
@@ -120,7 +121,10 @@ def qr_clip_rel_tokens(
     tiles: `E + 256` columns per head, column `c` holding
     key `c + (n_block_max - 10) * 128`, where `n_block_max` bounds the key
     blocks of the token's tile, plus the table's padding (keys right of the
-    diagonal, and for window layers those past the extent, are -inf)."""
+    diagonal, and for window layers those past the extent, are -inf).
+
+    `R_ONLY`: write the clipped r `(T, H, D_REL)` to `RelOut` instead of
+    the logits (for a kernel that computes them itself)."""
     E_PAD: tl.constexpr = E + 256
     heads = tl.arange(0, BLOCK_H)[:, None]
     h_mask = heads < H
@@ -143,6 +147,20 @@ def qr_clip_rel_tokens(
                 HAS_TAU,
             )
             tl.store(QOut + t * H * D + heads * D + q_cols, q, h_mask)
+        elif t < T and R_ONLY:
+            tau = tl.load(Tau + t) if HAS_TAU else 1.0
+            r = _l2_clip(
+                R + t * stride_r,
+                RScale,
+                heads,
+                r_cols,
+                h_mask,
+                r_threshold,
+                eps,
+                tau,
+                HAS_TAU,
+            )
+            tl.store(RelOut + t * H * D_REL + heads * D_REL + r_cols, r, h_mask)
         elif t < T:
             seq = tl.load(SeqIdx + t)
             q_start = tl.load(CuSeqlensQ + seq)

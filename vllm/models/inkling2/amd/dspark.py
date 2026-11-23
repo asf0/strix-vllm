@@ -11,6 +11,7 @@ from typing import cast
 import torch
 from torch import nn
 
+from vllm import _custom_ops as ops
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
@@ -48,6 +49,11 @@ from .ops.dspark import (
     silu_and_mul,
 )
 from .ops.norm import fused_add_rms_norm, rms_norm
+
+
+def draft_linear(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """bf16 GEMM of the draft layers (a hook for platform plugins)."""
+    return nn.functional.linear(x, weight)
 
 
 class _RMSNorm(nn.Module):
@@ -146,13 +152,26 @@ class Inkling2DraftSelfAttention(nn.Module):
     def _write_kv(
         self, k: torch.Tensor, v: torch.Tensor, slot_mapping: torch.Tensor
     ) -> None:
+        # vLLM's own cache op: FlashAttentionImpl's needs upstream flash-attn.
         impl = cast(FlashAttentionImpl, self.attn.impl)
-        impl.do_kv_cache_update(self.attn, k, v, self.attn.kv_cache, slot_mapping)
+        key_cache, value_cache = self.attn.kv_cache.transpose(1, 2).split(
+            impl.head_size, dim=-1
+        )
+        ops.reshape_and_cache_flash(
+            k,
+            v,
+            key_cache,
+            value_cache,
+            slot_mapping,
+            impl.kv_cache_dtype,
+            self.attn._k_scale,
+            self.attn._v_scale,
+        )
 
     def forward(
         self, positions: torch.Tensor, x: torch.Tensor, cos_sin_cache: torch.Tensor
     ) -> torch.Tensor:
-        qkv = nn.functional.linear(x, self.qkv_proj.weight)
+        qkv = draft_linear(x, self.qkv_proj.weight)
         qk_norm_rope_(
             qkv,
             positions,
@@ -202,7 +221,7 @@ class Inkling2DraftSelfAttention(nn.Module):
                 window=self.window,
                 num_splits=num_splits,
             )
-        return nn.functional.linear(out, self.o_proj.weight)
+        return draft_linear(out, self.o_proj.weight)
 
     def store_context_kv(
         self,
@@ -211,7 +230,7 @@ class Inkling2DraftSelfAttention(nn.Module):
         cos_sin_cache: torch.Tensor,
         slot_mapping: torch.Tensor | None,
     ) -> None:
-        k, v = nn.functional.linear(context, self.kv_proj_ctx.weight).split(
+        k, v = draft_linear(context, self.kv_proj_ctx.weight).split(
             [self.kv_size, self.kv_size], -1
         )
         k = self.k_norm_ctx(k.reshape(-1, self.head_dim))
@@ -240,8 +259,8 @@ class Inkling2DraftMLP(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = silu_and_mul(nn.functional.linear(x, self.gate_up_proj.weight))
-        return nn.functional.linear(x, self.down_proj.weight)
+        x = silu_and_mul(draft_linear(x, self.gate_up_proj.weight))
+        return draft_linear(x, self.down_proj.weight)
 
 
 class Inkling2DraftLayer(nn.Module):
