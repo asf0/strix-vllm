@@ -7,6 +7,7 @@ and the top-k combine.
 
 import torch
 
+from vllm.platforms.rocm import on_gfx1x
 from vllm.triton_utils import tl, tldevice, triton
 
 from .linear import _k_group_tile, k_group_partials
@@ -641,7 +642,9 @@ def route(
     head = 1 << (hidden.bit_length() - 1)
     tail = hidden - head
     assert tail & (tail - 1) == 0 and (tail == 0 or tail >= 32)
-    if tokens <= FUSED_ROUTING_MAX_TOKENS:
+    # The fused kernel's programs spin on each other's completion counters,
+    # which hangs on RDNA (gfx1151); it takes the unfused kernels there.
+    if tokens <= FUSED_ROUTING_MAX_TOKENS and not on_gfx1x():
         assert plan.tile >= tokens
         groups = triton.cdiv(hidden, 1024)
         block_n = 32
@@ -677,7 +680,7 @@ def route(
             TILE=plan.tile,
             MAX_CTAS=plan.max_ctas,
             num_warps=4,
-            num_stages=4,
+            num_stages=2 if on_gfx1x() else 4,
             enable_fp_fusion=False,
             launch_cooperative_grid=True,
         )
@@ -756,8 +759,8 @@ def combine(
     """Sum each token's rows of `down` (rows -1 count 0)."""
     tokens = src2dst.numel() // topk
     hidden = down.shape[1]
-    block = 512
-    assert hidden % block == 0
+    # Inkling 2 Mini's hidden size (2,304) is a multiple of 256, not 512.
+    block = next(b for b in (512, 256, 128, 64) if hidden % b == 0)
     out = torch.empty((tokens, hidden), dtype=out_dtype, device=down.device)
     _combine_kernel[(tokens, hidden // block)](
         down, src2dst, out, hidden, topk, block, num_warps=2

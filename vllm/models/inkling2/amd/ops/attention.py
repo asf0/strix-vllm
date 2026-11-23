@@ -12,6 +12,7 @@ programs (split-KV) and merge the partial outputs in a second launch.
 
 import torch
 
+from vllm.platforms.rocm import on_gfx1x
 from vllm.triton_utils import tl, tldevice, triton
 from vllm.utils.platform_utils import num_compute_units
 
@@ -25,6 +26,12 @@ _DECODE_BLOCK_M = 64
 # 256 requests of 1 and 8 queries over 1K to 100K keys).
 _SPLIT_PROGRAMS_PER_CU = 2
 _MAX_SPLITS = 128
+# gfx1151 decode: 16-key blocks, 2 warps and 8 split programs per compute
+# unit (WGP). Full layers over 27.5K keys at 1 request: 0.62 against 1.39 ms
+# (2 programs per unit, 64-key blocks); 0.54 ms streams the KV at 210 GB/s.
+_RDNA_DECODE_BLOCK_N = 16
+_RDNA_DECODE_WARPS = 2
+_RDNA_SPLIT_PROGRAMS_PER_CU = 8
 
 
 @triton.jit(do_not_specialize=["num_splits", "num_tokens"])
@@ -290,11 +297,14 @@ def plan_decode_attention(
         return 0
     work = max(1, num_reqs * num_kv_heads)
     num_cus = num_compute_units()
+    rdna = on_gfx1x()
+    block_n = _RDNA_DECODE_BLOCK_N if rdna else _BLOCK_N
+    per_cu = _RDNA_SPLIT_PROGRAMS_PER_CU if rdna else _SPLIT_PROGRAMS_PER_CU
     max_splits = _MAX_SPLITS
     if is_local:
         # One key block of the window per split, at most.
-        max_splits = triton.cdiv(rel_extent - 1, _BLOCK_N) + 1
-    return max(1, min(max_splits, _SPLIT_PROGRAMS_PER_CU * num_cus // work))
+        max_splits = triton.cdiv(rel_extent - 1, block_n) + 1
+    return max(1, min(max_splits, per_cu * num_cus // work))
 
 
 def rel_decode_attention(
@@ -429,6 +439,9 @@ def _launch(
     block_q = max(1, block_m // block_h)
     num_reqs = cache_seqlens.shape[0]
     split = out is None or lse is None
+    # gfx1151: split-KV decode tuning (its prefill runs in the libstrix plugin).
+    rdna_decode = split and on_gfx1x()
+    block_n = _RDNA_DECODE_BLOCK_N if rdna_decode else _BLOCK_N
     if split:
         assert max_seqlen_q <= block_q and num_splits > 0
         out = q.new_empty((num_splits * num_tokens, *q.shape[1:]), dtype=torch.float32)
@@ -476,8 +489,8 @@ def _launch(
         SPLIT=split,
         BLOCK_Q=block_q,
         BLOCK_H=block_h,
-        BLOCK_N=_BLOCK_N,
-        num_warps=4 if block_m <= 64 else 8,
+        BLOCK_N=block_n,
+        num_warps=_RDNA_DECODE_WARPS if rdna_decode else 4 if block_m <= 64 else 8,
         num_stages=1,
     )
     return out, lse

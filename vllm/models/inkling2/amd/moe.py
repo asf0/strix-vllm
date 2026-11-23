@@ -1,12 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Inkling2 mixture-of-experts layer (routed experts only, MXFP8).
+"""Inkling2 mixture-of-experts layer (routed experts only, MXFP8 or NVFP4).
 
 Experts are sharded contiguously over the TP group (EP size = TP size); each
 rank returns the full all-reduced bf16 output. Checkpoint names under
 `model.llm.layers.N.mlp` map 1:1 to parameters, kept in the checkpoint's
 layout.
 """
+
+from collections.abc import Sequence
+from typing import Literal
 
 import torch
 from torch import nn
@@ -24,6 +27,8 @@ from vllm.model_executor.utils import set_weight_attrs
 from .ops import triton_bmm
 from .ops.activation import swiglu_quantize
 from .ops.moe import NUM_COUNTERS, combine, route
+
+QuantFormat = Literal["nvfp4", "mxfp8"]
 
 
 class Inkling2Gate(nn.Module):
@@ -49,7 +54,7 @@ class Inkling2Gate(nn.Module):
 
 
 class Inkling2Experts(nn.Module):
-    def __init__(self, config) -> None:
+    def __init__(self, config, quant_format: QuantFormat = "mxfp8") -> None:
         super().__init__()
         self.ep_rank = get_tensor_model_parallel_rank()
         self.ep_size = get_tensor_model_parallel_world_size()
@@ -60,9 +65,21 @@ class Inkling2Experts(nn.Module):
         self.up_cap = config.mlp_up_softcap
         hidden, inter = config.hidden_size, config.intermediate_size
         self.hidden_size, self.intermediate_size = hidden, inter
+        self.nvfp4 = quant_format == "nvfp4"
+        pack, group = (2, 16) if self.nvfp4 else (1, 32)
+        weight_dtype = torch.uint8 if self.nvfp4 else torch.float8_e4m3fn
+        scale_dtype = torch.float8_e4m3fn if self.nvfp4 else torch.uint8
         for name, (n, k) in (("w13", (2 * inter, hidden)), ("w2", (hidden, inter))):
-            self._register(f"{name}_weight", (n, k), torch.float8_e4m3fn)
-            self._register(f"{name}_weight_scale", (n, k // 32), torch.uint8)
+            self._register(f"{name}_weight", (n, k // pack), weight_dtype)
+            self._register(f"{name}_weight_scale", (n, k // group), scale_dtype)
+            if self.nvfp4:
+                self._register(f"{name}_weight_amax", (), torch.float32)
+                self._register(
+                    f"{name}_weight_outer_scale_denominator",
+                    (1,),
+                    torch.float32,
+                    per_expert=False,
+                )
 
         start = self.ep_rank * self.num_experts
         self.register_buffer(
@@ -75,11 +92,18 @@ class Inkling2Experts(nn.Module):
             "counts", torch.zeros(self.num_experts, dtype=torch.int32), persistent=False
         )
 
-    def _register(self, name: str, shape: tuple[int, ...], dtype: torch.dtype) -> None:
-        param = nn.Parameter(
-            torch.empty((self.num_experts, *shape), dtype=dtype), requires_grad=False
-        )
-        set_weight_attrs(param, {"weight_loader": self._load_expert_shard})
+    def _register(
+        self,
+        name: str,
+        shape: tuple[int, ...],
+        dtype: torch.dtype,
+        per_expert: bool = True,
+    ) -> None:
+        if per_expert:
+            shape = (self.num_experts, *shape)
+        param = nn.Parameter(torch.empty(shape, dtype=dtype), requires_grad=False)
+        loader = self._load_expert_shard if per_expert else default_weight_loader
+        set_weight_attrs(param, {"weight_loader": loader})
         self.register_parameter(name, param)
 
     def _load_expert_shard(self, param: nn.Parameter, loaded: torch.Tensor) -> None:
@@ -95,6 +119,7 @@ class Inkling2Experts(nn.Module):
 
     def _gemm(self, quantized, name: str, tiles, plan) -> torch.Tensor:
         act, act_scale = quantized
+        assert not self.nvfp4, "NVFP4 experts run in the libstrix plugin"
         return triton_bmm.bmm(
             act,
             act_scale,
@@ -128,13 +153,27 @@ class Inkling2Experts(nn.Module):
 
 
 class Inkling2MoE(nn.Module):
-    def __init__(self, config) -> None:
+    def __init__(
+        self,
+        config,
+        quant_format: QuantFormat = "mxfp8",
+        visit_ids: Sequence[int] = (0,),
+    ) -> None:
+        """`visit_ids` (one per loop pass) matches the NVIDIA layer; routed
+        experts capture is not supported on ROCm."""
         super().__init__()
         assert config.n_shared_experts == 0
         self.gate = Inkling2Gate(config)
-        self.experts = Inkling2Experts(config)
+        self.experts = Inkling2Experts(config, quant_format)
+        self.num_passes = len(visit_ids)
+        if quant_format == "nvfp4" and type(self).forward.__module__ == __name__:
+            raise NotImplementedError(
+                "Inkling2 NVFP4 experts on ROCm need the libstrix plugin "
+                "(strix_vllm), which replaces Inkling2MoE.forward; it is not "
+                "installed or STRIX_DISABLE turned it off."
+            )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, pass_idx: int = 0) -> torch.Tensor:
         """bf16 [T, H] -> bf16 [T, H], reduced over the expert-parallel group.
         Padding tokens (`is_padding` of the forward context) are routed to
         no expert and come out as 0."""

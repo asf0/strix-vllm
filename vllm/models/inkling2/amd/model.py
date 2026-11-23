@@ -6,6 +6,8 @@ Decoder layers are tied together by block attention residuals: instead of a
 single residual stream, each sublayer input is a learned softmax mix over the
 outputs of previous blocks of `n_layers_per_attn_res_block` layers plus the
 running partial block. Residual blocks are stored in bf16; mixes are fp32.
+
+Looped checkpoints (`loop_config`) are `Inkling2LoopModel` (`loop.py`).
 """
 
 from collections import Counter
@@ -47,12 +49,12 @@ from ..processing import (
     Inkling2MultiModalProcessor,
     Inkling2ProcessingInfo,
 )
+from ..quant_config import Inkling2QuantConfig
 from .attention import Inkling2Attention
-from .moe import Inkling2MoE
+from .moe import Inkling2MoE, QuantFormat
 from .ops.attention import compute_log_scaling_tau
 from .ops.attn_res import attn_res
 from .ops.norm import rms_norm
-from .quant_config import Inkling2QuantConfig
 from .sconv import ATTN_STREAM, MLP_STREAM, Inkling2ConvState, Inkling2ShortConv
 from .vision import Inkling2VisionEncoder, VisionMetadata
 
@@ -124,7 +126,10 @@ class Inkling2DecoderLayer(nn.Module):
         layer_id: int,
         quant_config: Inkling2QuantConfig | None,
         prefix: str,
+        num_passes: int = 1,
     ) -> None:
+        """`num_passes > 1` (a loop core layer) gives each pass its own KV and
+        conv-state caches."""
         super().__init__()
         self.is_local = layer_id in config.local_layer_ids
         num_kv_heads = (
@@ -132,15 +137,23 @@ class Inkling2DecoderLayer(nn.Module):
             if self.is_local
             else config.num_key_value_heads
         )
-        self.conv_state = Inkling2ConvState(
-            num_kv_heads=num_kv_heads,
-            head_dim=config.swa_head_dim if self.is_local else config.head_dim,
-            hidden_size=config.hidden_size,
-            kernel_size=config.sconv_kernel_size,
-            prefix=f"{prefix}.conv_state",
+        self.conv_states = tuple(
+            Inkling2ConvState(
+                num_kv_heads=num_kv_heads,
+                head_dim=config.swa_head_dim if self.is_local else config.head_dim,
+                hidden_size=config.hidden_size,
+                kernel_size=config.sconv_kernel_size,
+                prefix=f"{prefix}.conv_state" + (f".pass{p}" if p else ""),
+            )
+            for p in range(num_passes)
         )
+        self.conv_state = self.conv_states[0]
         self.attn = Inkling2Attention(
-            config, self.is_local, self.conv_state, prefix=f"{prefix}.attn"
+            config,
+            self.is_local,
+            self.conv_state,
+            prefix=f"{prefix}.attn",
+            pass_conv_states=self.conv_states[1:],
         )
         eps = config.rms_norm_eps
         # Local layers: attn_norm; full layers: q/k/v_input_norm, stacked.
@@ -149,13 +162,12 @@ class Inkling2DecoderLayer(nn.Module):
             config.hidden_size, eps, num_inputs=self.num_attn_inputs
         )
         self.mlp_norm = Inkling2RMSNorm(config.hidden_size, eps)
-        if quant_config is None or not quant_config.is_mxfp8_layer(layer_id):
-            raise ValueError(
-                f"Inkling2 on ROCm runs MXFP8 experts only (layer {layer_id} "
-                "is not MXFP8); use an all-MXFP8 checkpoint such as "
-                "Inkling-2-Small-MXFP8"
-            )
-        self.mlp = Inkling2MoE(config)
+        expert_format: QuantFormat = (
+            "mxfp8"
+            if quant_config is not None and quant_config.is_mxfp8_layer(layer_id)
+            else "nvfp4"
+        )
+        self.mlp = Inkling2MoE(config, expert_format, config.layer_visit_ids(layer_id))
         self.attn_sconv, self.mlp_sconv = (
             Inkling2ShortConv(
                 config.hidden_size, config.sconv_kernel_size, self.conv_state, stream
@@ -168,14 +180,29 @@ class Inkling2DecoderLayer(nn.Module):
         positions: torch.Tensor,
         inputs: Sequence[torch.Tensor],
         tau: torch.Tensor | None,
+        out: torch.Tensor | None = None,
+        pass_idx: int = 0,
     ) -> torch.Tensor:
-        """This rank's partial attention output on the normalized `inputs`."""
-        if self.is_local:
-            return self.attn(positions, inputs[0])
-        return self.attn(positions, inputs[0], inputs[1], inputs[2], tau)
+        """This rank's partial attention output on the normalized `inputs`
+        (one for local layers, or separate q/k/v inputs)."""
+        if self.is_local and len(inputs) == 1:
+            return self.attn(positions, inputs[0], out=out, pass_idx=pass_idx)
+        return self.attn(
+            positions,
+            inputs[0],
+            inputs[1],
+            inputs[2],
+            None if self.is_local else tau,
+            out,
+            pass_idx,
+        )
 
 
 class Inkling2Model(nn.Module):
+    # Whether TP > 1 keeps a token shard of the hidden stream for large
+    # batches (sequence parallel).
+    seq_parallel_paths = True
+
     def __init__(
         self,
         config: Inkling2ModelConfig,
@@ -193,7 +220,7 @@ class Inkling2Model(nn.Module):
             config.hidden_size, config.rms_norm_eps, out_dtype=None
         )
         self.layers = nn.ModuleList(
-            Inkling2DecoderLayer(config, i, quant_config, f"{prefix}.layers.{i}")
+            self._make_layer(config, i, quant_config, f"{prefix}.layers.{i}")
             for i in range(config.num_hidden_layers)
         )
         self.attn_res = Inkling2AttnRes(config)
@@ -201,6 +228,15 @@ class Inkling2Model(nn.Module):
         # Layers whose input (the partial block) the DSpark draft reads; layer
         # id num_hidden_layers stands for the final-norm output.
         self.aux_hidden_state_layers: tuple[int, ...] = ()
+
+    def _make_layer(
+        self,
+        config: Inkling2ModelConfig,
+        layer_id: int,
+        quant_config: Inkling2QuantConfig | None,
+        prefix: str,
+    ) -> Inkling2DecoderLayer:
+        return Inkling2DecoderLayer(config, layer_id, quant_config, prefix)
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_norm(self.embed_tokens(input_ids))
@@ -210,11 +246,18 @@ class Inkling2Model(nn.Module):
         stack: torch.Tensor,
         last: torch.Tensor,
         query: torch.Tensor,
-        norm: Inkling2RMSNorm,
+        norm: Inkling2RMSNorm | None,
         addend: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        """The AttnRes mixes through `norm`, or the fp32 mixes without it."""
         return attn_res(
-            stack, last, addend, query, norm.weight, norm.eps, self.normalize_values
+            stack,
+            last,
+            addend,
+            query,
+            None if norm is None else norm.weight,
+            0.0 if norm is None else norm.eps,
+            self.normalize_values,
         )
 
     def forward(
@@ -229,13 +272,7 @@ class Inkling2Model(nn.Module):
         stack = inputs_embeds.new_empty((max_blocks + 1, num_tokens, hidden))
         stack[0].copy_(inputs_embeds)
         num_blocks = 0
-        tau = None
-        if self.config.log_scaling_n_floor is not None:
-            tau = compute_log_scaling_tau(
-                positions,
-                self.config.log_scaling_n_floor,
-                self.config.log_scaling_alpha,
-            )
+        tau = self._log_scaling_tau(positions)
         for i, layer in enumerate(self.layers):
             partial = stack[num_blocks]
             if i in self.aux_hidden_state_layers:
@@ -285,6 +322,13 @@ class Inkling2Model(nn.Module):
             return out, [*aux_hidden_states, out]
         return out
 
+    def _log_scaling_tau(self, positions: torch.Tensor) -> torch.Tensor | None:
+        if self.config.log_scaling_n_floor is None:
+            return None
+        return compute_log_scaling_tau(
+            positions, self.config.log_scaling_n_floor, self.config.log_scaling_alpha
+        )
+
 
 @MULTIMODAL_REGISTRY.register_processor(
     Inkling2MultiModalProcessor,
@@ -325,12 +369,12 @@ class Inkling2ForConditionalGeneration(
         quant_config = vllm_config.quant_config
         assert quant_config is None or isinstance(quant_config, Inkling2QuantConfig)
         assert vllm_config.parallel_config.pipeline_parallel_size == 1
-        from vllm.platforms.rocm import on_gfx950
+        from vllm.platforms.rocm import on_gfx950, on_gfx1151
 
-        if not on_gfx950():
+        if not (on_gfx950() or on_gfx1151()):
             raise ValueError(
-                "Inkling2 on ROCm requires gfx950 (CDNA4, MI350 series): its "
-                "kernels are written and validated for that architecture only"
+                "Inkling2 on ROCm requires gfx950 (CDNA4, MI350 series) or "
+                "gfx1151 (Strix Halo): its kernels are validated there only"
             )
         if vllm_config.model_config.enable_prompt_embeds:
             # The reference applies embed_norm to raw input embeddings, which
@@ -345,7 +389,12 @@ class Inkling2ForConditionalGeneration(
             and vllm_config.model_config.multimodal_config.get_limit_per_prompt("image")
             else None
         )
-        self.model = Inkling2Model(text_config, quant_config, f"{prefix}model")
+        model_cls: type[Inkling2Model] = Inkling2Model
+        if text_config.loop_config is not None:
+            from .loop import Inkling2LoopModel
+
+            model_cls = Inkling2LoopModel
+        self.model = model_cls(text_config, quant_config, f"{prefix}model")
         self.lm_head = ParallelLMHead(
             text_config.padded_vocab_size, text_config.hidden_size
         )

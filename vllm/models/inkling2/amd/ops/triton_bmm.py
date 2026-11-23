@@ -14,6 +14,7 @@ from dataclasses import dataclass
 
 import torch
 
+from vllm.platforms.rocm import on_gfx1x
 from vllm.triton_utils import tl, triton
 
 from .mxfp8 import _scale_offsets
@@ -119,7 +120,10 @@ def bmm(
     tile = plan.tile
     bm = min(max(tile, 16), 128)
     bn = 128 if n % 128 == 0 else 64
-    bk = 256 if k % 256 == 0 and bm >= 64 else 128
+    # RDNA's 64 KB of LDS: 128-wide K tiles, one stage for the largest tiles.
+    small_lds = on_gfx1x()
+    bk = 256 if k % 256 == 0 and bm >= 64 and not small_lds else 128
+    num_stages = 1 if small_lds and bm == 128 else 2
     assert n % bn == 0 and k % bk == 0
     sub = tile // bm if tile >= bm else 1
     _mxfp8_bmm_kernel[(n // bn, plan.max_ctas * sub)](
@@ -137,6 +141,6 @@ def bmm(
         BN=bn,
         BK=bk,
         num_warps=8 if bm == 128 and bk == 256 else 4,
-        num_stages=2,
+        num_stages=num_stages,
     )
     return out

@@ -26,7 +26,7 @@ if TYPE_CHECKING:
     from .quant_config import Inkling2QuantConfig
 
 # Each export's module under the platform's package (`amd/` on ROCm,
-# `nvidia/` elsewhere); `None` for one shared at the package root on NVIDIA.
+# `nvidia/` elsewhere), or at the package root for the shared ones.
 _MODULES = {
     "Inkling2DSparkModel": "dspark",
     "Inkling2ForConditionalGeneration": "model",
@@ -47,19 +47,38 @@ _MODULES = {
     "shift_rel_proj": "ops.sconv",
     "short_conv": "ops.sconv",
 }
-_NVIDIA_SHARED = {"quant_config"}
+_SHARED = {"quant_config"}
 
-__all__ = sorted(_MODULES)
+__all__ = [
+    "Inkling2DSparkModel",
+    "Inkling2ForConditionalGeneration",
+    "Inkling2LoopForConditionalGeneration",
+    "Inkling2MarkovHead",
+    "Inkling2QuantConfig",
+    "Inkling2VisionEncoder",
+    "add_softcap",
+    "attention_prologue",
+    "attn_res",
+    "block_decode_attention",
+    "gate_sink",
+    "gather_patches",
+    "markov_gate",
+    "mix_rmsnorm",
+    "rel_decode_attention",
+    "rms_norm",
+    "shift_rel_proj",
+    "short_conv",
+]
 
 
 def __getattr__(name: str):
     if name not in _MODULES:
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
     module = _MODULES[name]
-    if current_platform.is_rocm():
-        package = f"{__name__}.amd"
-    elif module in _NVIDIA_SHARED:
+    if module in _SHARED:
         package = __name__
+    elif current_platform.is_rocm():
+        package = f"{__name__}.amd"
     else:
         package = f"{__name__}.nvidia"
     return getattr(import_module(f"{package}.{module}"), name)
