@@ -12,6 +12,7 @@ programs (split-KV) and merge the partial outputs in a second launch.
 
 import torch
 
+from vllm.platforms.rocm import on_gfx1x
 from vllm.triton_utils import tl, tldevice, triton
 from vllm.utils.platform_utils import num_compute_units
 
@@ -25,6 +26,12 @@ _DECODE_BLOCK_M = 64
 # 256 requests of 1 and 8 queries over 1K to 100K keys).
 _SPLIT_PROGRAMS_PER_CU = 2
 _MAX_SPLITS = 128
+# gfx1151 decode: 16-key blocks, 2 warps and 8 split programs per compute
+# unit (WGP). Full layers over 27.5K keys at 1 request: 0.62 against 1.39 ms
+# (2 programs per unit, 64-key blocks); 0.54 ms streams the KV at 210 GB/s.
+_RDNA_DECODE_BLOCK_N = 16
+_RDNA_DECODE_WARPS = 2
+_RDNA_SPLIT_PROGRAMS_PER_CU = 8
 
 
 @triton.jit(do_not_specialize=["num_splits", "num_tokens"])
@@ -65,6 +72,7 @@ def _rel_attention_kernel(
     BLOCK_Q: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    HEAD_SPLIT: tl.constexpr = False,
 ):
     # `WINDOW` (or -1) is the largest visible query-key distance. `DRAFT`:
     # no relative logits, and every query sits at its request's last key.
@@ -74,7 +82,13 @@ def _rel_attention_kernel(
     # (-inf without keys). Otherwise programs tile the queries, and write the
     # output and (unless `DRAFT`) the natural-log LSE.
     BLOCK_M: tl.constexpr = BLOCK_Q * BLOCK_H
-    kv_head = tl.program_id(1)
+    # HEAD_SPLIT: programs per query head (rows are its queries) instead of
+    # per KV head (rows are queries x the padded head group).
+    if HEAD_SPLIT:
+        q_head = tl.program_id(1)
+        kv_head = q_head // GROUP
+    else:
+        kv_head = tl.program_id(1)
     req = tl.program_id(2)
     q_start = tl.load(CuSeqlensQ + req)
     q_len = tl.load(CuSeqlensQ + req + 1) - q_start
@@ -92,9 +106,14 @@ def _rel_attention_kernel(
     past = seq_len - q_len
 
     rows = tl.arange(0, BLOCK_M)
-    q_idx = q0 + rows // BLOCK_H
-    head = kv_head * GROUP + rows % BLOCK_H
-    row_valid = (q_idx < q_len) & (rows % BLOCK_H < GROUP)
+    if HEAD_SPLIT:
+        q_idx = q0 + rows
+        head = tl.full([BLOCK_M], 0, tl.int32) + q_head
+        row_valid = q_idx < q_len
+    else:
+        q_idx = q0 + rows // BLOCK_H
+        head = kv_head * GROUP + rows % BLOCK_H
+        row_valid = (q_idx < q_len) & (rows % BLOCK_H < GROUP)
     token = (q_start + q_idx).to(tl.int64)
     d = tl.arange(0, D)
     q = tl.load(
@@ -290,11 +309,14 @@ def plan_decode_attention(
         return 0
     work = max(1, num_reqs * num_kv_heads)
     num_cus = num_compute_units()
+    rdna = on_gfx1x()
+    block_n = _RDNA_DECODE_BLOCK_N if rdna else _BLOCK_N
+    per_cu = _RDNA_SPLIT_PROGRAMS_PER_CU if rdna else _SPLIT_PROGRAMS_PER_CU
     max_splits = _MAX_SPLITS
     if is_local:
         # One key block of the window per split, at most.
-        max_splits = triton.cdiv(rel_extent - 1, _BLOCK_N) + 1
-    return max(1, min(max_splits, _SPLIT_PROGRAMS_PER_CU * num_cus // work))
+        max_splits = triton.cdiv(rel_extent - 1, block_n) + 1
+    return max(1, min(max_splits, per_cu * num_cus // work))
 
 
 def rel_decode_attention(
@@ -423,19 +445,35 @@ def _launch(
     page, num_kv_heads = key_cache.shape[1:3]
     group = num_heads // num_kv_heads
     assert q.stride(2) == key_cache.stride(3) == value_cache.stride(3) == 1
-    block_h = triton.next_power_of_2(group)
+    split = out is None or lse is None
+    # gfx1151 full-layer prefill: a program per query head, so head groups of
+    # 3 do not pad the rows to 4 (8k-token chunk over 24.5k keys: 194 against
+    # 222 ms, same output). Window layers keep KV-head programs (their keys
+    # are few, and per-head programs re-read them: 16.4 against 9.4 ms).
+    head_split = not split and on_gfx1x() and window < 0 and group & (group - 1) != 0
+    block_h = 1 if head_split else triton.next_power_of_2(group)
     # Rows (tokens x heads) per program: at least one 16-row MFMA tile.
-    block_m = min(128, max(16, triton.next_power_of_2(max_seqlen_q * block_h)))
+    # gfx1151 prefill: 16-key blocks, 64-row tiles with 4 warps for window
+    # layers and 128-row tiles with 8 warps for full ones (2.6-2.7x the gfx950
+    # tile on Inkling 2 Mini's 5k-token prefill; full layers 22.8 against
+    # 25.2 ms with 64 rows at 6.9k tokens, same output).
+    rdna_prefill = not split and on_gfx1x()
+    max_block_m = 64 if rdna_prefill and window >= 0 else 128
+    block_m = min(max_block_m, max(16, triton.next_power_of_2(max_seqlen_q * block_h)))
+    block_n = _RDNA_DECODE_BLOCK_N if on_gfx1x() else _BLOCK_N
     block_q = max(1, block_m // block_h)
     num_reqs = cache_seqlens.shape[0]
-    split = out is None or lse is None
     if split:
         assert max_seqlen_q <= block_q and num_splits > 0
         out = q.new_empty((num_splits * num_tokens, *q.shape[1:]), dtype=torch.float32)
         lse = q.new_empty((num_heads, num_splits * num_tokens), dtype=torch.float32)
         grid = (num_splits, num_kv_heads, num_reqs)
     else:
-        grid = (triton.cdiv(max_seqlen_q, block_q), num_kv_heads, num_reqs)
+        grid = (
+            triton.cdiv(max_seqlen_q, block_q),
+            num_heads if head_split else num_kv_heads,
+            num_reqs,
+        )
     assert out is not None and lse is not None
     assert out.stride(2) == 1
     if num_tokens == 0:
@@ -476,8 +514,11 @@ def _launch(
         SPLIT=split,
         BLOCK_Q=block_q,
         BLOCK_H=block_h,
-        BLOCK_N=_BLOCK_N,
-        num_warps=4 if block_m <= 64 else 8,
+        BLOCK_N=block_n,
+        HEAD_SPLIT=head_split,
+        num_warps=(
+            _RDNA_DECODE_WARPS if split and on_gfx1x() else 4 if block_m <= 64 else 8
+        ),
         num_stages=1,
     )
     return out, lse
@@ -639,7 +680,10 @@ def gate_sink(
     assert gate.stride(1) == sinks.stride(1) == 1
     assert result.shape == gate.shape and result.is_contiguous()
     width = gate.shape[1]
-    _gate_sink_kernel[(num_tokens, triton.cdiv(width, 512))](
+    # RDNA: a whole row per program, 8 warps (gfx1151, 5k tokens: 0.80
+    # against 1.33 ms, same output).
+    block, warps = (triton.next_power_of_2(width), 8) if on_gfx1x() else (512, 4)
+    _gate_sink_kernel[(num_tokens, triton.cdiv(width, block))](
         output,
         gate,
         lse,
@@ -652,7 +696,8 @@ def gate_sink(
         sinks.stride(0),
         num_heads,
         width // num_heads,
-        512,
+        block,
+        num_warps=warps,
         enable_fp_fusion=False,
     )
 

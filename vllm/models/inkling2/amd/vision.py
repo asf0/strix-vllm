@@ -50,6 +50,40 @@ class VisionMetadata(NamedTuple):
     max_seqlen: int
 
 
+def _varlen_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    max_seqlen: int,
+    scale: float,
+) -> torch.Tensor:
+    """Non-causal attention within each `cu_seqlens` segment of `(T, H, D)`
+    q/k/v: upstream flash-attn where installed, else SDPA per segment."""
+    try:
+        return flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_k=cu_seqlens,
+            max_seqlen_q=max_seqlen,
+            max_seqlen_k=max_seqlen,
+            softmax_scale=scale,
+            causal=False,
+        )
+    except ImportError:
+        pass
+    out = torch.empty_like(q)
+    bounds = cu_seqlens.tolist()
+    for start, end in zip(bounds[:-1], bounds[1:]):
+        segment = (t[start:end].transpose(0, 1) for t in (q, k, v))
+        out[start:end] = F.scaled_dot_product_attention(
+            *segment, scale=scale
+        ).transpose(0, 1)
+    return out
+
+
 class Inkling2VisionAttention(nn.Module):
     def __init__(self, width: int, num_heads: int) -> None:
         super().__init__()
@@ -62,16 +96,13 @@ class Inkling2VisionAttention(nn.Module):
         qkv = self.qkv_proj(hidden)
         apply_rotary_qk_(qkv, metadata.meta, self.num_heads)
         q, k, v = qkv.view(-1, 3, self.num_heads, self.head_dim).unbind(1)
-        out = flash_attn_varlen_func(
+        out = _varlen_attention(
             q,
             k,
             v,
-            cu_seqlens_q=metadata.cu_seqlens,
-            cu_seqlens_k=metadata.cu_seqlens,
-            max_seqlen_q=metadata.max_seqlen,
-            max_seqlen_k=metadata.max_seqlen,
-            softmax_scale=self.head_dim**-0.5,
-            causal=False,
+            metadata.cu_seqlens,
+            metadata.max_seqlen,
+            self.head_dim**-0.5,
         )
         return self.out_proj(out.view(hidden.shape))
 

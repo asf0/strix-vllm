@@ -5,6 +5,7 @@
 
 import torch
 
+from vllm.platforms.rocm import on_gfx1x
 from vllm.triton_utils import tl, triton
 
 
@@ -127,8 +128,9 @@ def k_group_partials(
         block_n,
         split,
         num_warps=4 if block_n <= 64 else 8,
-        # gfx950's 160 KB of LDS fits two stages of the largest tiles.
-        num_stages=2,
+        # gfx950's 160 KB of LDS fits two stages of the largest tiles;
+        # RDNA's 64 KB fits one.
+        num_stages=1 if on_gfx1x() and block_n == 128 else 2,
         enable_fp_fusion=False,
     )
     return out

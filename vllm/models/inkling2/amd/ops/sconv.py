@@ -25,6 +25,7 @@ RMS-normalizes V per head and writes both to the paged KV cache.
 import torch
 
 from vllm.models.inkling2.amd.ops.norm import qr_clip_rel_tokens
+from vllm.platforms.rocm import on_gfx1x
 from vllm.triton_utils import tl, triton
 
 
@@ -416,8 +417,13 @@ def short_conv(
     width = weight.shape[1]
     # Prefill tiles skip the cache reads they never need.
     prefill = num_tokens > 256
+    num_warps = 4
     if num_tokens <= 8:
         block_t, block_c = 1, 1024
+    elif prefill and on_gfx1x():
+        # gfx1151, 5k tokens: 1.07 / 1.21 / 1.36 ms (plain / addend /
+        # residual) against 1.43 / 1.47 / 1.55 with 4 x 256, 4 warps.
+        block_t, block_c, num_warps = 2, 1024, 8
     else:
         block_t, block_c = (4, 256) if prefill else (2, 512)
     block_c = min(triton.next_power_of_2(channels), block_c)
@@ -454,7 +460,7 @@ def short_conv(
         BT=block_t,
         BLOCK_C=block_c,
         SKIP_IDLE_CACHE=prefill,
-        num_warps=4,
+        num_warps=num_warps,
         enable_fp_fusion=False,
     )
     return out
@@ -549,11 +555,13 @@ def _attn_prologue_kernel(
     BLOCK_HQ: tl.constexpr,
     BLOCK_E: tl.constexpr,
     QR_TOKENS: tl.constexpr,
+    FUSE_QR: tl.constexpr,
+    R_ONLY: tl.constexpr = False,
 ):
     # Programs (tile, head, 0 | 1) run the K | V conv of one KV head; programs
     # (tile, head, 2) clip q of QR_TOKENS of the tile's tokens and programs
     # (tile, head, 3 + c) their r and column block c of the relative logits.
-    if tl.program_id(2) >= 2:
+    if FUSE_QR and tl.program_id(2) >= 2:
         if tl.program_id(1) * QR_TOKENS < BT:
             qr_clip_rel_tokens(
                 tl.program_id(0) * BT + tl.program_id(1) * QR_TOKENS,
@@ -584,6 +592,7 @@ def _attn_prologue_kernel(
                 HAS_TAU,
                 BLOCK_HQ,
                 BLOCK_E,
+                R_ONLY,
             )
     else:
         _kv_conv_tile(
@@ -628,6 +637,73 @@ def _attn_prologue_kernel(
             DYNAMIC,
             BT,
         )
+
+
+@triton.jit
+def _qr_rel_kernel(
+    q_ptr,
+    r_ptr,
+    q_scale_ptr,
+    r_scale_ptr,
+    tau_ptr,
+    rel_proj_ptr,
+    q_out_ptr,
+    rel_out_ptr,
+    seq_idx_ptr,
+    cu_seqlens_q_ptr,
+    seq_lens_ptr,
+    T,
+    stride_q,
+    stride_r,
+    clip_threshold,
+    rel_threshold,
+    clip_eps,
+    HQ: tl.constexpr,
+    D: tl.constexpr,
+    D_REL: tl.constexpr,
+    E: tl.constexpr,
+    SHIFT_W: tl.constexpr,
+    HAS_TAU: tl.constexpr,
+    BLOCK_HQ: tl.constexpr,
+    BLOCK_E: tl.constexpr,
+    QR_TOKENS: tl.constexpr,
+    R_ONLY: tl.constexpr = False,
+):
+    # Runs alongside the K/V conv launch (`_attn_prologue_kernel` without
+    # FUSE_QR), which started it after its own grid dependency wait; waiting
+    # for that launch before exiting keeps the KV cache written for the
+    # attention that follows.
+    qr_clip_rel_tokens(
+        tl.program_id(0) * QR_TOKENS,
+        QR_TOKENS,
+        tl.program_id(1) - 1,
+        T,
+        q_ptr,
+        r_ptr,
+        q_scale_ptr,
+        r_scale_ptr,
+        tau_ptr,
+        rel_proj_ptr,
+        q_out_ptr,
+        rel_out_ptr,
+        seq_idx_ptr,
+        cu_seqlens_q_ptr,
+        seq_lens_ptr,
+        stride_q,
+        stride_r,
+        clip_threshold,
+        rel_threshold,
+        clip_eps,
+        HQ,
+        D,
+        D_REL,
+        E,
+        SHIFT_W,
+        HAS_TAU,
+        BLOCK_HQ,
+        BLOCK_E,
+        R_ONLY,
+    )
 
 
 @triton.jit
@@ -740,6 +816,33 @@ def _kv_conv_tile(
     tl.store(dst, y.to(cache.dtype.element_ty), mask=(kv_slot >= 0)[:, None])
 
 
+# From this many tokens, q/r run in their own launch (8 tokens per program)
+# beside the K/V convs (8 per program): the fused launch's one-token q/r
+# programs dominate prefill.
+_PROLOGUE_SPLIT_MIN_TOKENS = 2048
+
+# A kernel plugin may set it to run the prologue's K/V convs for prefill
+# batches (from `_PROLOGUE_SPLIT_MIN_TOKENS` tokens): called with the K/V
+# inputs, weights, caches and conv metadata as `attention_prologue` gets them
+# (plus the conv `scale` and the clip / norm constants); returns False to
+# leave them to `_attn_prologue_kernel`.
+kv_conv_prefill = None
+
+
+def _prologue_block_t(num_tokens: int) -> int:
+    return 8 if num_tokens >= _PROLOGUE_SPLIT_MIN_TOKENS else 4
+
+
+def _prologue_qr_tokens(num_tokens: int) -> int:
+    """Tokens per program of the separate q/r launch, or 0 to run q/r in the
+    K/V conv launch."""
+    if num_tokens < _PROLOGUE_SPLIT_MIN_TOKENS:
+        return 0
+    # RDNA: a token per program, 8 warps (2.05 against 2.76 ms at 5k tokens
+    # on gfx1151, same output).
+    return 1 if on_gfx1x() else 8
+
+
 def attention_prologue(
     q: torch.Tensor,
     r: torch.Tensor,
@@ -771,6 +874,7 @@ def attention_prologue(
     rel_threshold: float,
     norm_eps: float,
     clip_eps: float = 1e-6,
+    r_only: bool = False,
 ) -> None:
     """Attention input processing in one launch.
 
@@ -783,6 +887,8 @@ def attention_prologue(
     `seq_lens`. Runs the
     K/V short convolutions, clips K, RMS-normalizes V and inserts both into
     the KV cache (tokens with `kv_slot_mapping < 0` skip the write).
+    With `r_only`, `rel_out` `(T, HQ, D_rel)` gets the clipped r instead of
+    the logits.
 
     `q` `(T, HQ, D)`, `r` `(T, HQ, D_rel)` and `k`/`v`
     `(T, H * D)` may be row-strided; K and V occupy `[0, D)` and
@@ -800,7 +906,12 @@ def attention_prologue(
     assert k_weight.stride() == v_weight.stride()
     assert q.shape[1:] == (num_q_heads, head_dim)
     assert q_out.shape == q.shape
-    assert rel_out.shape == (q.shape[0] + 128, num_q_heads, extent + 256)
+    rel_shape = (
+        (q.shape[0], num_q_heads, d_rel)
+        if r_only
+        else (q.shape[0] + 128, num_q_heads, extent + 256)
+    )
+    assert rel_out.shape == rel_shape
     assert q.stride(2) == 1 and q.stride(1) == head_dim
     assert r.stride(2) == 1 and r.stride(1) == d_rel
     assert q_out.is_contiguous() and rel_out.is_contiguous()
@@ -819,16 +930,23 @@ def attention_prologue(
     else:
         width = k_weight.shape[1]
         dyn_strides = (0, 0)
-    block_t = 4
-    grid = (triton.cdiv(num_tokens, block_t), num_heads, 3 + (extent + 256) // block_e)
-    _attn_prologue_kernel[grid](
+    block_t = _prologue_block_t(num_tokens)
+    qr_tokens = _prologue_qr_tokens(num_tokens)
+    qr_blocks = 2 if r_only else 1 + (extent + 256) // block_e
+    grid = (
+        triton.cdiv(num_tokens, block_t),
+        num_heads,
+        2 + (0 if qr_tokens else qr_blocks),
+    )
+    # Prefill (q/r in their own launch): a kernel plugin may run the K/V
+    # convs instead (see `kv_conv_prefill`).
+    kv_done = bool(qr_tokens) and kv_conv_prefill is not None and kv_conv_prefill(
         k,
         v,
         k_weight,
         v_weight,
-        # Unused placeholders for static convs keep both branches typed alike.
-        k_dynamic if dynamic else k_weight,
-        v_dynamic if dynamic else v_weight,
+        k_dynamic,
+        v_dynamic,
         cache,
         key_cache,
         value_cache,
@@ -838,51 +956,108 @@ def attention_prologue(
         slot_mapping,
         block_table,
         query_start,
-        num_tokens,
-        k.stride(0),
-        v.stride(0),
-        k_weight.stride(0),
-        k_weight.stride(1),
-        *dyn_strides,
-        cache.stride(0),
-        cache.stride(1),
-        cache.stride(2),
-        key_cache.stride(0),
-        key_cache.stride(1),
-        key_cache.stride(2),
-        key_cache.shape[1],
-        block_table.stride(0),
-        block_table.shape[1],
-        cache.shape[2],
-        (width * (2 if dynamic else 1) + 1) ** -0.5,
-        clip_threshold,
-        clip_eps,
-        norm_eps,
-        q,
-        r,
-        q_scale,
-        r_scale,
-        tau,
-        rel_proj,
-        q_out,
-        rel_out,
-        cu_seqlens_q,
-        seq_lens,
-        q.stride(0),
-        r.stride(0),
-        rel_threshold,
-        W=width,
-        D=head_dim,
-        DYNAMIC=dynamic,
-        BT=block_t,
-        HQ=num_q_heads,
-        D_REL=d_rel,
-        E=extent,
-        SHIFT_W=rel_proj.shape[2],
-        HAS_TAU=tau is not None,
-        BLOCK_HQ=max(triton.next_power_of_2(num_q_heads), 16),
-        BLOCK_E=block_e,
-        QR_TOKENS=triton.cdiv(block_t, num_heads),
-        num_warps=4,
-        enable_fp_fusion=False,
+        scale=(width * (2 if dynamic else 1) + 1) ** -0.5,
+        clip_threshold=clip_threshold,
+        clip_eps=clip_eps,
+        norm_eps=norm_eps,
     )
+    if not kv_done:
+        _attn_prologue_kernel[grid](
+            k,
+            v,
+            k_weight,
+            v_weight,
+            # Unused placeholders for static convs keep both branches typed alike.
+            k_dynamic if dynamic else k_weight,
+            v_dynamic if dynamic else v_weight,
+            cache,
+            key_cache,
+            value_cache,
+            kv_slot_mapping,
+            positions,
+            seq_idx,
+            slot_mapping,
+            block_table,
+            query_start,
+            num_tokens,
+            k.stride(0),
+            v.stride(0),
+            k_weight.stride(0),
+            k_weight.stride(1),
+            *dyn_strides,
+            cache.stride(0),
+            cache.stride(1),
+            cache.stride(2),
+            key_cache.stride(0),
+            key_cache.stride(1),
+            key_cache.stride(2),
+            key_cache.shape[1],
+            block_table.stride(0),
+            block_table.shape[1],
+            cache.shape[2],
+            (width * (2 if dynamic else 1) + 1) ** -0.5,
+            clip_threshold,
+            clip_eps,
+            norm_eps,
+            q,
+            r,
+            q_scale,
+            r_scale,
+            tau,
+            rel_proj,
+            q_out,
+            rel_out,
+            cu_seqlens_q,
+            seq_lens,
+            q.stride(0),
+            r.stride(0),
+            rel_threshold,
+            W=width,
+            D=head_dim,
+            DYNAMIC=dynamic,
+            BT=block_t,
+            HQ=num_q_heads,
+            D_REL=d_rel,
+            E=extent,
+            SHIFT_W=rel_proj.shape[2],
+            HAS_TAU=tau is not None,
+            BLOCK_HQ=max(triton.next_power_of_2(num_q_heads), 16),
+            BLOCK_E=block_e,
+            QR_TOKENS=triton.cdiv(block_t, num_heads),
+            FUSE_QR=not qr_tokens,
+            R_ONLY=r_only,
+            num_warps=4,
+            enable_fp_fusion=False,
+        )
+    if qr_tokens:
+        _qr_rel_kernel[(triton.cdiv(num_tokens, qr_tokens), qr_blocks)](
+            q,
+            r,
+            q_scale,
+            r_scale,
+            tau,
+            rel_proj,
+            q_out,
+            rel_out,
+            seq_idx,
+            cu_seqlens_q,
+            seq_lens,
+            num_tokens,
+            q.stride(0),
+            r.stride(0),
+            clip_threshold,
+            rel_threshold,
+            clip_eps,
+            HQ=num_q_heads,
+            D=head_dim,
+            D_REL=d_rel,
+            E=extent,
+            SHIFT_W=rel_proj.shape[2],
+            HAS_TAU=tau is not None,
+            BLOCK_HQ=max(triton.next_power_of_2(num_q_heads), 16),
+            BLOCK_E=block_e,
+            QR_TOKENS=qr_tokens,
+            R_ONLY=r_only,
+            num_warps=8 if on_gfx1x() else 4,
+            enable_fp_fusion=False,
+        )
