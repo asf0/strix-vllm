@@ -971,6 +971,8 @@ def clear_layer_kv_caches(layers: Iterable[Any]) -> None:
             continue
         kv_cache = layer.kv_cache
         layer.kv_cache = torch.tensor([]) if isinstance(kv_cache, torch.Tensor) else []
+        if hasattr(layer, "kv_views"):
+            layer.kv_views = None
         # Clean up quantized KV cache scale views
         # (int8_per_token_head, fp8_per_token_head)
         if hasattr(layer, "impl"):

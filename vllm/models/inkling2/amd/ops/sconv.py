@@ -825,7 +825,8 @@ _PROLOGUE_SPLIT_MIN_TOKENS = 2048
 # batches (from `_PROLOGUE_SPLIT_MIN_TOKENS` tokens): called with the K/V
 # inputs, weights, caches and conv metadata as `attention_prologue` gets them
 # (plus the conv `scale` and the clip / norm constants); returns False to
-# leave them to `_attn_prologue_kernel`.
+# leave them to `_attn_prologue_kernel`. It must take every batch of an int8
+# cache, which `_attn_prologue_kernel` does not write.
 kv_conv_prefill = None
 
 
@@ -833,10 +834,11 @@ def _prologue_block_t(num_tokens: int) -> int:
     return 8 if num_tokens >= _PROLOGUE_SPLIT_MIN_TOKENS else 4
 
 
-def _prologue_qr_tokens(num_tokens: int) -> int:
+def _prologue_qr_tokens(num_tokens: int, quantized: bool) -> int:
     """Tokens per program of the separate q/r launch, or 0 to run q/r in the
-    K/V conv launch."""
-    if num_tokens < _PROLOGUE_SPLIT_MIN_TOKENS:
+    K/V conv launch (never for a quantized cache, whose K/V convs are the
+    plugin's)."""
+    if num_tokens < _PROLOGUE_SPLIT_MIN_TOKENS and not quantized:
         return 0
     # RDNA: a token per program, 8 warps (2.05 against 2.76 ms at 5k tokens
     # on gfx1151, same output).
@@ -931,7 +933,8 @@ def attention_prologue(
         width = k_weight.shape[1]
         dyn_strides = (0, 0)
     block_t = _prologue_block_t(num_tokens)
-    qr_tokens = _prologue_qr_tokens(num_tokens)
+    quantized = key_cache.dtype == torch.int8
+    qr_tokens = _prologue_qr_tokens(num_tokens, quantized)
     qr_blocks = 2 if r_only else 1 + (extent + 256) // block_e
     grid = (
         triton.cdiv(num_tokens, block_t),
@@ -962,6 +965,7 @@ def attention_prologue(
         norm_eps=norm_eps,
     )
     if not kv_done:
+        assert not quantized, "an int8 KV cache needs the plugin's kv_conv_prefill"
         _attn_prologue_kernel[grid](
             k,
             v,

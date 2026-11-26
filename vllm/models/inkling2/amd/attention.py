@@ -3,13 +3,14 @@
 """Inkling2 attention: relative-bias GQA with short-conv K/V, L2-clipped
 q/k/r, gated output and per-token attention sinks."""
 
-from typing import cast
+from typing import ClassVar, cast
 
 import torch
 from torch import nn
 
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
-from vllm.config import VllmConfig, get_current_vllm_config
+from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
+from vllm.config.cache import CacheDType
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -22,20 +23,30 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.models.inkling.amd.sconv_swa_attn import InklingConvState
-from vllm.utils.torch_utils import canonicalize_singleton_dim_strides
+from vllm.utils.torch_utils import (
+    canonicalize_singleton_dim_strides,
+    kv_cache_dtype_str_to_dtype,
+)
 from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.attention.backends.flash_attn import (
     FlashAttentionBackend,
     FlashAttentionMetadata,
     FlashAttentionMetadataBuilder,
 )
+from vllm.v1.attention.backends.triton_attn import TritonAttentionBackend
 from vllm.v1.core.single_type_kv_cache_manager import (
     FullAttentionManager,
     SlidingWindowManager,
 )
-from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheLayerConfig
+from vllm.v1.kv_cache_interface import (
+    AttentionSpec,
+    KVCacheLayerConfig,
+    get_kv_quant_mode,
+)
 
 from ..configs import Inkling2ModelConfig
+from .ops import attention as port_ops
+from .ops import sconv
 from .ops.attention import (
     gated_rel_attention,
     plan_decode_attention,
@@ -54,6 +65,18 @@ class Inkling2AttentionMetadataBuilder(FlashAttentionMetadataBuilder):
 
 
 class Inkling2AttentionBackend(FlashAttentionBackend):
+    supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
+        "auto",
+        "bfloat16",
+        "int8_per_token_head",
+    ]
+
+    @classmethod
+    def customize_spec(cls, spec: "AttentionSpec") -> "AttentionSpec":
+        # int8_per_token_head packs one fp32 scale after each head's data;
+        # publish the same inline padding the Triton backend's kernels read.
+        return TritonAttentionBackend.customize_spec(spec)
+
     @staticmethod
     def get_builder_cls() -> type[FlashAttentionMetadataBuilder]:
         return Inkling2AttentionMetadataBuilder
@@ -66,6 +89,10 @@ def inkling2_linear(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     return nn.functional.linear(x, weight)
 
 
+# A kernel plugin may replace `gated_rel_attention` and `rel_decode_attention`
+# in this module. An int8 cache needs it to: those and `rel_attention_prefill`
+# then also get the fp32 `k_scale` / `v_scale` views `(num_blocks, N, Hkv)`.
+
 # Prefill relative attention from the clipped r instead of the sheared logits
 # (a kernel plugin may set it): called as `gated_rel_attention` with `r`
 # `(T, H, d_rel)` and the `(d_rel, extent)` `rel_proj` in place of
@@ -74,24 +101,89 @@ def inkling2_linear(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
 rel_attention_prefill = None
 
 
+def _check_cache_config(cache_config: CacheConfig) -> None:
+    """Refuse a KV cache the kernels at hand cannot write and read."""
+    cache_dtype = cache_config.cache_dtype
+    if cache_dtype in ("auto", "bfloat16"):
+        return
+    if cache_dtype != "int8_per_token_head":
+        raise ValueError(
+            "Inkling 2 KV cache dtype must be auto, bfloat16 or "
+            f"int8_per_token_head (got {cache_dtype!r})"
+        )
+    if cache_config.block_size % 32:
+        raise ValueError(
+            "Inkling 2 int8 KV cache needs a KV block size that is a "
+            f"multiple of 32 (got {cache_config.block_size})"
+        )
+    # The port's own kernels would run bf16 code on the int8 cache.
+    missing = [
+        name
+        for name, absent in (
+            ("inkling2_attention", rel_attention_prefill is None),
+            (
+                "inkling2_rel_decode",
+                rel_decode_attention is port_ops.rel_decode_attention,
+            ),
+            ("inkling2_kv_conv", sconv.kv_conv_prefill is None),
+        )
+        if absent
+    ]
+    if missing:
+        raise ValueError(
+            "Inkling 2 int8 KV cache needs the libstrix kernels "
+            f"({', '.join(missing)}) that are missing or disabled; "
+            "run with --kv-cache-dtype bfloat16 or enable them"
+        )
+
+
 def _kv_cache_layer_config(
     vllm_config: VllmConfig,
     num_kv_heads: int,
     head_dim: int,
     sliding_window: int | None,
 ) -> KVCacheLayerConfig:
+    cache_dtype = vllm_config.cache_config.cache_dtype
     spec = AttentionSpec(
         block_size=vllm_config.cache_config.block_size,
         num_kv_heads=num_kv_heads,
         head_size=head_dim,
-        dtype=vllm_config.model_config.dtype,
+        dtype=kv_cache_dtype_str_to_dtype(cache_dtype, vllm_config.model_config),
+        kv_quant_mode=get_kv_quant_mode(cache_dtype),
     )
     if sliding_window is not None:
         return SlidingWindowManager.layer_config(spec, sliding_window=sliding_window)
     return FullAttentionManager.layer_config(spec)
 
 
-class Inkling2AttentionPassCache(nn.Module, AttentionLayerBase):
+class Inkling2CacheLayer(AttentionLayerBase):
+    """A layer with a paged KV cache and the kernels' views of it."""
+
+    # Of the bound cache: the `(num_blocks, N, Hkv, D)` key and value caches,
+    # and the `k_scale` / `v_scale` views of an int8 cache (empty for bf16).
+    kv_views: tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]] | None = None
+
+    def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
+        super().bind_kv_cache(kv_cache)
+        # `[K | V]` per (head, slot); int8_per_token_head appends one fp32
+        # scale to each half (see TritonAttentionBackend.customize_spec).
+        half = kv_cache.shape[-1] // 2
+        k, v = kv_cache.transpose(1, 2).split(half, dim=-1)
+        scales = {}
+        if kv_cache.dtype == torch.int8:
+            scales = {
+                "k_scale": k.view(torch.float32)[..., -1],
+                "v_scale": v.view(torch.float32)[..., -1],
+            }
+            k, v = k[..., :-4], v[..., :-4]
+        self.kv_views = (
+            canonicalize_singleton_dim_strides(k),
+            canonicalize_singleton_dim_strides(v),
+            scales,
+        )
+
+
+class Inkling2AttentionPassCache(nn.Module, Inkling2CacheLayer):
     """The KV cache of one extra loop pass of a looped `Inkling2Attention`
     (each pass of the loop core attends over its own keys and values)."""
 
@@ -125,7 +217,7 @@ class Inkling2AttentionPassCache(nn.Module, AttentionLayerBase):
         )
 
 
-class Inkling2Attention(nn.Module, AttentionLayerBase):
+class Inkling2Attention(nn.Module, Inkling2CacheLayer):
     """Inkling2 attention for one decoder layer.
 
     Local layers project all of q/k/v from one input; full layers project the
@@ -247,7 +339,7 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
         )
 
         vllm_config = get_current_vllm_config()
-        assert vllm_config.cache_config.cache_dtype in ("auto", "bfloat16")
+        _check_cache_config(vllm_config.cache_config)
         self.kv_cache = torch.tensor([])
         forward_context = vllm_config.compilation_config.static_forward_context
         if prefix in forward_context:
@@ -268,12 +360,11 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
             self.sliding_window if self.is_local else None,
         )
 
-    def _pass_cache(self, pass_idx: int) -> tuple[str, torch.Tensor]:
-        """The attention metadata key and KV cache of loop pass `pass_idx`."""
+    def _pass_cache(self, pass_idx: int) -> Inkling2CacheLayer:
+        """The layer owning the KV cache of loop pass `pass_idx`."""
         if pass_idx == 0 or not self.pass_caches:
-            return self.prefix, self.kv_cache
-        cache = self.pass_caches[pass_idx - 1]
-        return cache.prefix, cache.kv_cache
+            return self
+        return self.pass_caches[pass_idx - 1]
 
     def _project(
         self, x_q: torch.Tensor, x_k: torch.Tensor, x_v: torch.Tensor
@@ -288,15 +379,6 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
         k = inkling2_linear(x_k, weight[q_side:k_end])
         v = inkling2_linear(x_v, weight[k_end : k_end + kv_size])
         return [*projected.split(self.q_side_splits, dim=-1)[:4], k, v]
-
-    def _split_kv_cache(
-        self, kv_cache: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        key_cache, value_cache = kv_cache.transpose(1, 2).split(self.head_dim, dim=-1)
-        return (
-            canonicalize_singleton_dim_strides(key_cache),
-            canonicalize_singleton_dim_strides(value_cache),
-        )
 
     def forward(
         self,
@@ -363,17 +445,17 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
         token count.
         """
         attn_metadata = get_forward_context().attn_metadata
-        layer_name, kv_cache = self._pass_cache(pass_idx)
+        cache = self._pass_cache(pass_idx)
         conv_state = self.conv_states[pass_idx]
-        if not isinstance(attn_metadata, dict) or kv_cache.numel() == 0:
+        if not isinstance(attn_metadata, dict) or cache.kv_views is None:
             output.zero_()
             return
-        md = cast(FlashAttentionMetadata, attn_metadata[layer_name])
+        md = cast(FlashAttentionMetadata, attn_metadata[cache.prefix])
         conv_md = conv_metadata(conv_state)
         assert conv_md is not None
         num_tokens = q.shape[0]
         q = q.view(num_tokens, self.num_heads, self.head_dim)
-        key_cache, value_cache = self._split_kv_cache(kv_cache)
+        key_cache, value_cache, scales = cache.kv_views
         clipped_q = q.new_empty(q.shape)
         # Decode and verify batches split the keys; the split count follows
         # the batch alone, so it holds for every replay of a CUDA graph.
@@ -452,6 +534,7 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
                 softmax_scale=self.scaling,
                 is_local=self.is_local,
                 num_splits=num_splits,
+                **scales,
             )
             return
         # Fused: r and the projection in place of the sheared logits.
@@ -472,4 +555,5 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
             num_actual_tokens=md.num_actual_tokens,
             softmax_scale=self.scaling,
             window=self.window,
+            **scales,
         )
