@@ -332,7 +332,9 @@ class Qwen4ExpQSAImpl(AttentionImplBase[Qwen4ExpQSAMetadata]):
     ) -> torch.Tensor:
         """Run sparse attention over the owner's indexer-selected K/V rows."""
         num_tokens = attn_metadata.num_actual_tokens
-        output.zero_()
+        # The kernels write every actual row; padded rows only need to stay
+        # finite for the row-wise ops after attention.
+        output[num_tokens:].zero_()
         if num_tokens == 0:
             return output
 
@@ -411,6 +413,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         vllm_config: VllmConfig,
         config: Qwen4ExpTextConfig,
         layer_id: int,
+        topk_indices_buffer: torch.Tensor,
         quant_config: QuantizationConfig | None = None,
         reduce_results: bool = True,
         prefix: str = "",
@@ -538,16 +541,9 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             and self.head_dim & (self.head_dim - 1) == 0
             and self.kv_cache_dtype not in _OCTAVE_CACHE_DTYPES
         )
-        max_tokens = vllm_config.scheduler_config.max_num_batched_tokens
-        self.register_buffer(
-            "topk_indices_buffer",
-            torch.empty(
-                max_tokens,
-                self.indexer.output_width,
-                dtype=torch.int32,
-            ),
-            persistent=False,
-        )
+        if topk_indices_buffer.shape[1] != self.indexer.output_width:
+            raise ValueError("QSA top-k buffer width does not match the indexer")
+        self.topk_indices_buffer = topk_indices_buffer
 
         static_context = vllm_config.compilation_config.static_forward_context
         if self.layer_name in static_context:
